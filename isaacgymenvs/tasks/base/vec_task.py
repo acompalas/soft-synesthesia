@@ -47,7 +47,10 @@ import sys
 import abc
 from abc import ABC
 
-import open3d as o3d
+try:
+    import open3d as o3d
+except (ImportError, OSError):
+    o3d = None  # only needed for camera/point-cloud observations (legacy_obs=False)
 
 from isaacgymenvs.utils.quat_utils import quaternion_apply
 
