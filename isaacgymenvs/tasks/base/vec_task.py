@@ -49,7 +49,7 @@ from abc import ABC
 
 import open3d as o3d
 
-import pytorch3d
+from isaacgymenvs.utils.quat_utils import quaternion_apply
 
 EXISTING_SIM = None
 SCREEN_CAPTURE_RESOLUTION = (1027, 768)
@@ -738,7 +738,7 @@ class VecTask(Env):
                 batch_camera_pose = self.camera_pose_tensor.unsqueeze(1).unsqueeze(2)
                 # Let's add some randomization on point cloud.
                 pc = (1 + 0.006 * torch.randn_like(pc)) * pc
-                pc = pytorch3d.transforms.quaternion_apply(batch_camera_pose[..., 3:], pc)
+                pc = quaternion_apply(batch_camera_pose[..., 3:], pc)
     
                 pc = pc + batch_camera_pose[..., :3] - self.root_state_tensor[self.hand_indices, :3].unsqueeze(1).unsqueeze(1)
                 pc = process_robot_pc(pc, self.pc_bound, num_sampled_points=self.num_point, segmentation=batch_segmentation_image)
