@@ -178,6 +178,15 @@ class AllegroArmMOAR(VecTask):
                   'set_obj16_cylinder_axis']
         }
 
+        # Generated column objects (make_column_objects.py): objSet=columns
+        columns_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    '../../assets/urdf/objects/meshes/columns.json')
+        if os.path.exists(columns_path):
+            with open(columns_path) as f:
+                column_names = json.load(f)["names"]
+            self.asset_files_dict.update({n: "urdf/objects/{}.urdf".format(n) for n in column_names})
+            self.object_sets["columns"] = column_names
+
         self.object_set_id = self.cfg["env"].get("objSet", "0")
         self.used_training_objects = self.object_sets[str(self.object_set_id)]
         self.num_training_objects = len(self.used_training_objects)
