@@ -338,8 +338,10 @@ class VecTask(Env):
         # if running with a viewer, set up keyboard shortcuts and camera
         if self.headless == False:
             # subscribe to keyboard shortcuts
-            self.viewer = self.gym.create_viewer(
-                self.sim, gymapi.CameraProperties())
+            viewer_props = gymapi.CameraProperties()
+            if "viewer_fov" in self.cfg["env"]:  # optional, e.g. +task.env.viewer_fov=50 (horizontal, degrees)
+                viewer_props.horizontal_fov = float(self.cfg["env"]["viewer_fov"])
+            self.viewer = self.gym.create_viewer(self.sim, viewer_props)
             self.gym.subscribe_viewer_keyboard_event(
                 self.viewer, gymapi.KEY_ESCAPE, "QUIT")
             self.gym.subscribe_viewer_keyboard_event(
@@ -1064,6 +1066,8 @@ class VecTask(Env):
                 #               {'stiffness': {'range': [0.75, 1.5], 'operation': 'scaling', 'distribution': 'loguniform'}
                 for prop_name, prop_attrs in actor_properties.items():
                     if prop_name == 'color':
+                        if not prop_attrs:  # color: False in the config means no colour randomization
+                            continue
                         num_bodies = self.gym.get_actor_rigid_body_count(
                             env, handle)
                         for n in range(num_bodies):

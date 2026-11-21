@@ -143,7 +143,9 @@ class AllegroArmMOAR(VecTask):
         self.ignore_z = (self.object_type == "pen")
 
         self.robot_asset_files_dict = {
-            "thick": "urdf/xarm6/xarm6_allegro_right_fsr_2023_thin.urdf"
+            "thick": "urdf/xarm6/xarm6_allegro_right_fsr_2023_thin.urdf",
+            # each pad split into 2x2 cells (make_split_robot_urdf.py); select with task.env.sensor=split4
+            "split4": "urdf/xarm6/xarm6_allegro_right_fsr_2023_thin_split4.urdf",
         }
 
         self.asset_files_dict = {
@@ -183,9 +185,14 @@ class AllegroArmMOAR(VecTask):
                                     '../../assets/urdf/objects/meshes/columns.json')
         if os.path.exists(columns_path):
             with open(columns_path) as f:
-                column_names = json.load(f)["names"]
+                columns_reg = json.load(f)
+            column_names = columns_reg["names"]
             self.asset_files_dict.update({n: "urdf/objects/{}.urdf".format(n) for n in column_names})
             self.object_sets["columns"] = column_names
+            # held-out split (columns.json "train"/"test"): policies train on columns_train only,
+            # columns_test is used only for evaluation and shape reconstruction
+            self.object_sets["columns_train"] = columns_reg["train"]
+            self.object_sets["columns_test"] = columns_reg["test"]
 
         self.object_set_id = self.cfg["env"].get("objSet", "0")
         self.used_training_objects = self.object_sets[str(self.object_set_id)]
@@ -267,6 +274,11 @@ class AllegroArmMOAR(VecTask):
                                      "link_6.0_fsr", "link_7.0_tip_fsr", "link_9.0_fsr", "link_10.0_fsr",
                                      "link_11.0_tip_fsr", "link_14.0_fsr", "link_15.0_fsr", "link_15.0_tip_fsr",
                                      "link_0.0_fsr", "link_4.0_fsr", "link_8.0_fsr", "link_13.0_fsr"]
+
+        self.pad_names = list(self.contact_sensor_names)
+        self.n_cells = 4 if self.cfg["env"]["sensor"] == "split4" else 1
+        self.contact_sensor_names = [p if k == 0 else "{}_c{}".format(p, k)
+                                     for p in self.pad_names for k in range(self.n_cells)]  # pad-major
 
         self.tip_sensor_names = ["link_3.0_tip_fsr",  "link_7.0_tip_fsr",
                                 "link_11.0_tip_fsr", "link_15.0_tip_fsr"]
@@ -697,6 +709,9 @@ class AllegroArmMOAR(VecTask):
 
             # add object
             obj_class_indice = np.random.randint(0, len(self.used_training_objects), 1)[0]
+            rec_obj = self.cfg["env"].get("record_object", None)
+            if i == 0 and rec_obj:  # touch-rollout recorder: force env 0's object
+                obj_class_indice = self.used_training_objects.index(rec_obj)
             select_obj = self.used_training_objects[obj_class_indice]
             # randomize initial quat
             if self.object_set_id == "cross": 
@@ -770,6 +785,8 @@ class AllegroArmMOAR(VecTask):
                     obj_scale = np.random.uniform(1.0, 1.1)
                 else:
                     obj_scale = np.random.uniform(0.95, 1.1)
+                if i == 0 and self.cfg["env"].get("replay_file", None):  # state replay: same object scale
+                    obj_scale = float(np.load(self.cfg["env"]["replay_file"])["obj_scale"])
                 self.gym.set_actor_scale(env_ptr, object_handle, obj_scale)
                 # Do some friction randomization
                 rand_friction =  np.random.uniform(self.randomize_friction_lower, self.randomize_friction_upper)
@@ -806,6 +823,12 @@ class AllegroArmMOAR(VecTask):
         sensor_handles = [self.gym.find_actor_rigid_body_handle(env_ptr, arm_hand_actor, sensor_name)
                           for sensor_name in self.contact_sensor_names]
         self.sensor_handle_indices = to_torch(sensor_handles, dtype=torch.int64)
+        pad_handles = sensor_handles[::self.n_cells]  # cell 0 of each pad = the pad link
+        extra_cells = set(sensor_handles) - set(pad_handles)
+        n_env_bodies = self.gym.get_env_rigid_body_count(env_ptr)
+        keep = [b for b in range(n_env_bodies) if b not in extra_cells]
+        self.critic_body_indices = to_torch(keep, dtype=torch.int64)
+        self.critic_pad_slots = to_torch([keep.index(h) for h in pad_handles], dtype=torch.int64)
 
         arm_handles = [self.gym.find_actor_rigid_body_handle(env_ptr, arm_hand_actor, sensor_name)
                           for sensor_name in self.arm_sensor_names]
@@ -1044,10 +1067,10 @@ class AllegroArmMOAR(VecTask):
                 self.states_buf[:, obs_end:obs_end + self.num_actions] = self.actions
                 self.states_buf[:, obs_end + self.num_actions: obs_end + self.num_actions + 24] = self.spin_axis.repeat(1, 8)
 
-                all_contact = self.contact_tensor.reshape(-1, self.num_bodies, 3).clone()
+                all_contact = self._critic_body_contacts()
                 all_contact = torch.norm(all_contact, dim=-1).float()
                 all_contact = torch.where(all_contact >= 20.0, torch.ones_like(all_contact), all_contact / 20.0)
-                self.states_buf[:, obs_end + self.num_actions + 24: obs_end + self.num_actions + 24 + self.num_bodies] = all_contact
+                self.states_buf[:, obs_end + self.num_actions + 24: obs_end + self.num_actions + 24 + all_contact.shape[1]] = all_contact
                 self.states_buf[:, obs_end + self.num_actions + 24 + 49:
                                    obs_end + self.num_actions + 24 + 49 + self.num_training_objects] = self.object_one_hot_vector
 
@@ -1061,8 +1084,7 @@ class AllegroArmMOAR(VecTask):
 
             self.last_obs_buf[:, 22:45] = 0
 
-            contacts = self.contact_tensor.reshape(-1, self.num_bodies, 3).clone() 
-            contacts = contacts[:, self.sensor_handle_indices, :]
+            contacts = self._pad_contact_forces()
             tip_contacts = contacts[:, self.fingertip_indices, :]
 
             contacts = torch.norm(contacts, dim=-1)
@@ -1130,10 +1152,10 @@ class AllegroArmMOAR(VecTask):
                 self.states_buf[:, obs_end:obs_end + self.num_actions] = self.actions
                 self.states_buf[:, obs_end + self.num_actions: obs_end + self.num_actions + 24] = self.spin_axis.repeat(1, 8)
 
-                all_contact = self.contact_tensor.reshape(-1, self.num_bodies, 3).clone()
+                all_contact = self._critic_body_contacts()
                 all_contact = torch.norm(all_contact, dim=-1).float()
                 all_contact = torch.where(all_contact >= 20.0, torch.ones_like(all_contact), all_contact / 20.0)
-                self.states_buf[:, obs_end + self.num_actions + 24: obs_end + self.num_actions + 24 + self.num_bodies] = all_contact
+                self.states_buf[:, obs_end + self.num_actions + 24: obs_end + self.num_actions + 24 + all_contact.shape[1]] = all_contact
                 self.states_buf[:, obs_end + self.num_actions + 24 + 49:
                                    obs_end + self.num_actions + 24 + 49 + self.num_training_objects] = self.object_one_hot_vector  
 
@@ -1146,8 +1168,7 @@ class AllegroArmMOAR(VecTask):
             self.last_obs_buf[:, 0:6] = 0.0
             self.last_obs_buf[:, 22:45] = 0
 
-            contacts = self.contact_tensor.reshape(-1, self.num_bodies, 3).clone() 
-            contacts = contacts[:, self.sensor_handle_indices, :] 
+            contacts = self._pad_contact_forces()
             tip_contacts = contacts[:, self.fingertip_indices, :]
 
             contacts = torch.norm(contacts, dim=-1)
@@ -1221,10 +1242,10 @@ class AllegroArmMOAR(VecTask):
                 self.states_buf[:, obs_end:obs_end + self.num_actions] = self.actions
                 self.states_buf[:, obs_end + self.num_actions: obs_end + self.num_actions + 24] = self.spin_axis.repeat(1, 8)
 
-                all_contact = self.contact_tensor.reshape(-1, self.num_bodies, 3).clone()
+                all_contact = self._critic_body_contacts()
                 all_contact = torch.norm(all_contact, dim=-1).float()
                 all_contact = torch.where(all_contact >= 20.0, torch.ones_like(all_contact), all_contact / 20.0)
-                self.states_buf[:, obs_end + self.num_actions + 24: obs_end + self.num_actions + 24 + self.num_bodies] = all_contact
+                self.states_buf[:, obs_end + self.num_actions + 24: obs_end + self.num_actions + 24 + all_contact.shape[1]] = all_contact
                 if not self.pc_ablation:
                     if self.cfg["env"]["pc_category"] == "laptop_smallpn_fulldata" or self.cfg["env"]["pc_category"] == "bucket_mediumpn_fulldata":
                         self.states_buf[:, obs_end + self.num_actions + 24 + 49:
@@ -1247,8 +1268,7 @@ class AllegroArmMOAR(VecTask):
             self.last_obs_buf[:, 0:6] = 0.0
             self.last_obs_buf[:, 22:45] = 0
 
-            contacts = self.contact_tensor.reshape(-1, self.num_bodies, 3).clone() 
-            contacts = contacts[:, self.sensor_handle_indices, :]
+            contacts = self._pad_contact_forces()
             tip_contacts = contacts[:, self.fingertip_indices, :]
 
             contacts = torch.norm(contacts, dim=-1)
@@ -1326,10 +1346,10 @@ class AllegroArmMOAR(VecTask):
                 self.states_buf[:, obs_end:obs_end + self.num_actions] = self.actions
                 self.states_buf[:, obs_end + self.num_actions: obs_end + self.num_actions + 24] = self.spin_axis.repeat(1, 8)
 
-                all_contact = self.contact_tensor.reshape(-1, self.num_bodies, 3).clone()
+                all_contact = self._critic_body_contacts()
                 all_contact = torch.norm(all_contact, dim=-1).float()
                 all_contact = torch.where(all_contact >= 20.0, torch.ones_like(all_contact), all_contact / 20.0)
-                self.states_buf[:, obs_end + self.num_actions + 24: obs_end + self.num_actions + 24 + self.num_bodies] = all_contact
+                self.states_buf[:, obs_end + self.num_actions + 24: obs_end + self.num_actions + 24 + all_contact.shape[1]] = all_contact
 
                 end_pos = obs_end + self.num_actions + 24 + 49 
                 self.states_buf[:, end_pos:end_pos + 16] = self.prev_targets[:, 6:22]
@@ -1340,8 +1360,7 @@ class AllegroArmMOAR(VecTask):
             self.last_obs_buf[:, 0:6] = 0.0
             self.last_obs_buf[:, 22:45] = 0
 
-            contacts = self.contact_tensor.reshape(-1, self.num_bodies, 3).clone()  
-            contacts = contacts[:, self.sensor_handle_indices, :] 
+            contacts = self._pad_contact_forces()
             tip_contacts = contacts[:, self.fingertip_indices, :]
 
             contacts = torch.norm(contacts, dim=-1)
@@ -1406,10 +1425,10 @@ class AllegroArmMOAR(VecTask):
                 self.states_buf[:, obs_end:obs_end + self.num_actions] = self.actions
                 self.states_buf[:, obs_end + self.num_actions: obs_end + self.num_actions + 24] = self.spin_axis.repeat(1, 8)
 
-                all_contact = self.contact_tensor.reshape(-1, self.num_bodies, 3).clone()
+                all_contact = self._critic_body_contacts()
                 all_contact = torch.norm(all_contact, dim=-1).float()
                 all_contact = torch.where(all_contact >= 20.0, torch.ones_like(all_contact), all_contact / 20.0)
-                self.states_buf[:, obs_end + self.num_actions + 24: obs_end + self.num_actions + 24 + self.num_bodies] = all_contact
+                self.states_buf[:, obs_end + self.num_actions + 24: obs_end + self.num_actions + 24 + all_contact.shape[1]] = all_contact
                 self.states_buf[:, obs_end + self.num_actions + 24 + 49:
                                    obs_end + self.num_actions + 24 + 49 + self.num_training_objects] = self.object_one_hot_vector.reshape(-1, 2)[:, :1]  
 
@@ -1422,8 +1441,7 @@ class AllegroArmMOAR(VecTask):
             self.last_obs_buf[:, 0:6] = 0.0
             self.last_obs_buf[:, 22:45] = 0
 
-            contacts = self.contact_tensor.reshape(-1, self.num_bodies, 3).clone()  
-            contacts = contacts[:, self.sensor_handle_indices, :] 
+            contacts = self._pad_contact_forces()
             tip_contacts = contacts[:, self.fingertip_indices, :]
 
             contacts = torch.norm(contacts, dim=-1)
@@ -1494,10 +1512,10 @@ class AllegroArmMOAR(VecTask):
                 self.states_buf[:, obs_end:obs_end + self.num_actions] = self.actions
                 self.states_buf[:, obs_end + self.num_actions: obs_end + self.num_actions + 24] = self.spin_axis.repeat(1, 8)
 
-                all_contact = self.contact_tensor.reshape(-1, self.num_bodies, 3).clone()
+                all_contact = self._critic_body_contacts()
                 all_contact = torch.norm(all_contact, dim=-1).float()
                 all_contact = torch.where(all_contact >= 20.0, torch.ones_like(all_contact), all_contact / 20.0)
-                self.states_buf[:, obs_end + self.num_actions + 24: obs_end + self.num_actions + 24 + self.num_bodies] = all_contact
+                self.states_buf[:, obs_end + self.num_actions + 24: obs_end + self.num_actions + 24 + all_contact.shape[1]] = all_contact
                 self.states_buf[:, obs_end + self.num_actions + 24 + 49:
                                    obs_end + self.num_actions + 24 + 49 + self.num_training_objects] = self.object_one_hot_vector.reshape(-1, 2)[:, :1]  
 
@@ -1510,8 +1528,7 @@ class AllegroArmMOAR(VecTask):
             self.last_obs_buf[:, 0:6] = 0.0
             self.last_obs_buf[:, 22:45] = 0
 
-            contacts = self.contact_tensor.reshape(-1, self.num_bodies, 3).clone()  
-            contacts = contacts[:, self.sensor_handle_indices, :] 
+            contacts = self._pad_contact_forces()
             tip_contacts = contacts[:, self.fingertip_indices, :]
 
             contacts = torch.norm(contacts, dim=-1)
@@ -1574,10 +1591,10 @@ class AllegroArmMOAR(VecTask):
                 self.states_buf[:, obs_end:obs_end + self.num_actions] = self.actions
                 self.states_buf[:, obs_end + self.num_actions: obs_end + self.num_actions + 24] = self.spin_axis.repeat(1, 8)
 
-                all_contact = self.contact_tensor.reshape(-1, self.num_bodies, 3).clone()
+                all_contact = self._critic_body_contacts()
                 all_contact = torch.norm(all_contact, dim=-1).float()
                 all_contact = torch.where(all_contact >= 20.0, torch.ones_like(all_contact), all_contact / 20.0)
-                self.states_buf[:, obs_end + self.num_actions + 24: obs_end + self.num_actions + 24 + self.num_bodies] = all_contact
+                self.states_buf[:, obs_end + self.num_actions + 24: obs_end + self.num_actions + 24 + all_contact.shape[1]] = all_contact
                 self.states_buf[:, obs_end + self.num_actions + 24 + 49:
                                    obs_end + self.num_actions + 24 + 49 + self.num_training_objects] = self.object_one_hot_vector
 
@@ -1590,8 +1607,7 @@ class AllegroArmMOAR(VecTask):
             self.last_obs_buf[:, 0:6] = 0.0
             self.last_obs_buf[:, 22:45] = 0
 
-            contacts = self.contact_tensor.reshape(-1, self.num_bodies, 3).clone() 
-            contacts = contacts[:, self.sensor_handle_indices, :] 
+            contacts = self._pad_contact_forces()
             tip_contacts = contacts[:, self.fingertip_indices, :]
 
             contacts = torch.norm(contacts, dim=-1)
@@ -1961,17 +1977,22 @@ class AllegroArmMOAR(VecTask):
 
         # We do some debug visualization.
         if condition:
+            # +task.env.color_cells=True: yellow = this cell carries force but its pad is below threshold
+            color_cells = self.cfg["env"].get("color_cells", False)
+            if color_cells:
+                cell_mag = torch.norm(self.contact_tensor.reshape(-1, self.num_bodies, 3)[:, self.sensor_handle_indices, :],
+                                      dim=-1).cpu().numpy()
             for env in range(len(self.envs)):
                 for i, contact_idx in enumerate(list(self.sensor_handle_indices)):
 
-                    if self.debug_contacts[env, i] > 0.0:
-                        self.gym.set_rigid_body_color(self.envs[env], self.arm_hands[env],
-                                                      contact_idx, gymapi.MESH_VISUAL_AND_COLLISION,
-                                                      gymapi.Vec3(0.0, 1.0, 0.0))
+                    if self.debug_contacts[env, i // self.n_cells] > 0.0:
+                        color = gymapi.Vec3(0.0, 1.0, 0.0)
+                    elif color_cells and cell_mag[env, i] > float(self.cfg["env"].get("color_cells_min", 0.05)):
+                        color = gymapi.Vec3(1.0, 0.85, 0.0)
                     else:
-                        self.gym.set_rigid_body_color(self.envs[env], self.arm_hands[env],
-                                                      contact_idx, gymapi.MESH_VISUAL_AND_COLLISION,
-                                                      gymapi.Vec3(1.0, 0.0, 0.0))
+                        color = gymapi.Vec3(1.0, 0.0, 0.0)
+                    self.gym.set_rigid_body_color(self.envs[env], self.arm_hands[env],
+                                                  contact_idx, gymapi.MESH_VISUAL_AND_COLLISION, color)
 
                 import math
                 if self.debug_viz:
@@ -1986,6 +2007,237 @@ class AllegroArmMOAR(VecTask):
                         self.gym.set_rigid_body_color(self.envs[env], self.arm_hands[env],
                                                     contact_idx, gymapi.MESH_VISUAL_AND_COLLISION,
                                                     gymapi.Vec3(*color))
+
+        self._run_state_replay()
+        self._record_touch_step()
+
+    # ------------------------------------------------------------------ split-pad sensing
+    def _pad_contact_forces(self):
+        """(num_envs, 16, 3) net contact force per pad. With split pads this is the vector sum of the
+        pad's cells, which equals the net force the unsplit pad body would report."""
+        cells = self.contact_tensor.reshape(-1, self.num_bodies, 3)[:, self.sensor_handle_indices, :]
+        pads = cells.reshape(self.num_envs, 16, self.n_cells, 3).sum(dim=2)
+        self.last_pad_forces = pads
+        return pads.clone()
+
+    def _cell_contact_forces(self):
+        """(num_envs, 16 * n_cells, 3) world-frame force per cell, and (num_envs, 16 * n_cells)
+        compressive normal force (force component pushing into the pad, along -local x)."""
+        cells = self.contact_tensor.reshape(-1, self.num_bodies, 3)[:, self.sensor_handle_indices, :]
+        quat = self.rigid_body_states[:, self.sensor_handle_indices, 3:7]
+        x_axis = torch.zeros_like(cells); x_axis[..., 0] = 1.0
+        normal = quat_apply(quat.reshape(-1, 4), x_axis.reshape(-1, 3)).reshape(cells.shape)
+        f_normal = torch.clamp(-(cells * normal).sum(-1), min=0.0)
+        return cells, f_normal
+
+    def _critic_body_contacts(self):
+        """Per-body contact forces for the critic with each pad's cells merged into the pad,
+        so the critic input has the same size and meaning as with the unsplit robot."""
+        allc = self.contact_tensor.reshape(-1, self.num_bodies, 3)
+        if self.n_cells == 1:
+            return allc.clone()
+        out = allc[:, self.critic_body_indices, :].clone()
+        out[:, self.critic_pad_slots, :] = self._pad_contact_forces()
+        return out
+
+    # ------------------------------------------------------------------ state replay
+    # +task.env.replay_file=<touch_rollout.npz from the recorder> +task.env.replay_out=<out.npz>
+    # For every recorded step: put env 0's hand joints and object into the recorded state, apply the
+    # recorded object mass, friction and joint targets, simulate replay_substeps physics substeps, and
+    # save the pad and cell forces. Every step starts from the same state on any robot, so differences
+    # between robots come only from the pads. Runs once at the first step, saves, and exits.
+    def _run_state_replay(self):
+        path = self.cfg["env"].get("replay_file", None)
+        if not path:
+            return
+        d = np.load(path)
+        n_sub = int(self.cfg["env"].get("replay_substeps", 1))
+        env0 = self.envs[0]
+        obj_h = self.gym.find_actor_handle(env0, "object")
+        obj_idx = int(self.object_indices[0])
+        T = len(d["dof_pos"])
+        pad_f, cell_f, cell_fn = [], [], []
+        last_mass, last_fric = None, None
+        for t in range(T):
+            m, fr = float(d["obj_mass"][t]), float(d["friction"][t])
+            if m != last_mass:
+                props = self.gym.get_actor_rigid_body_properties(env0, obj_h)
+                props[0].mass = m
+                self.gym.set_actor_rigid_body_properties(env0, obj_h, props)
+                last_mass = m
+            if fr != last_fric:
+                hp = self.gym.get_actor_rigid_shape_properties(env0, self.arm_hands[0])
+                for p in hp:
+                    p.friction = fr
+                self.gym.set_actor_rigid_shape_properties(env0, self.arm_hands[0], hp)
+                op = self.gym.get_actor_rigid_shape_properties(env0, obj_h)
+                for p in op:
+                    p.friction = fr
+                self.gym.set_actor_rigid_shape_properties(env0, obj_h, op)
+                last_fric = fr
+            self.arm_hand_dof_pos[0] = torch.as_tensor(d["dof_pos"][t], device=self.device)
+            self.arm_hand_dof_vel[0] = torch.as_tensor(d["dof_vel"][t], device=self.device)
+            self.root_state_tensor[obj_idx] = torch.as_tensor(d["obj_state"][t], device=self.device)
+            if self.cfg["env"].get("replay_object_away", False):  # diagnostic: hand-only contacts
+                self.root_state_tensor[obj_idx, 2] += 5.0
+            self.gym.set_dof_state_tensor(self.sim, gymtorch.unwrap_tensor(self.dof_state))
+            self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_state_tensor))
+            self.cur_targets[0] = torch.as_tensor(d["targets"][t], device=self.device)
+            for _ in range(n_sub):
+                self.update_controller()
+                self.gym.simulate(self.sim)
+                self.gym.fetch_results(self.sim, True)
+            self.gym.refresh_net_contact_force_tensor(self.sim)
+            self.gym.refresh_rigid_body_state_tensor(self.sim)
+            pad_f.append(torch.norm(self._pad_contact_forces()[0], dim=-1).cpu().numpy())
+            cells, fn = self._cell_contact_forces()
+            cell_f.append(cells[0].cpu().numpy())
+            cell_fn.append(fn[0].cpu().numpy())
+        out = self.cfg["env"].get("replay_out", "replay.npz")
+        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+        np.savez(out, pad_force=np.array(pad_f), cell_force=np.array(cell_f), cell_fn=np.array(cell_fn),
+                 n_cells=self.n_cells, substeps=n_sub, sensor=self.cfg["env"]["sensor"],
+                 pad_names=np.array(self.pad_names), source=path)
+        print(f"[replay] {T} steps, {n_sub} substep(s) each, sensor={self.cfg['env']['sensor']}: saved {out}")
+        import sys
+        sys.exit(0)
+
+    # ------------------------------------------------------------------ touch-rollout recorder
+    # Enabled with +task.env.record_dir=<dir>. Records env 0 for record_steps control steps:
+    # the 16 sensed touch signals (what the policy sees), the 16 raw pad force norms, and
+    # reset flags; saves viewer snapshots of env 0 at record_snaps roughly evenly spaced steps.
+    # Camera: record_cam=[distance_m, azimuth_deg, elevation_deg] around env 0's object.
+    # Camera test: +task.env.record_cam_test=True saves one snapshot per (dist, az, el) combination
+    # from record_test_dists / record_test_azs / record_test_els at the first step, then exits.
+    def _set_record_camera(self, target, dist, az, el):
+        az, el = np.radians(az), np.radians(el)
+        pos = target + dist * np.array([np.cos(el) * np.cos(az), np.cos(el) * np.sin(az), np.sin(el)])
+        self.gym.viewer_camera_look_at(self.viewer, self.envs[0],
+                                       gymapi.Vec3(*pos.tolist()), gymapi.Vec3(*target.tolist()))
+
+    def _save_viewer_image(self, path):
+        self.gym.step_graphics(self.sim)
+        self.gym.draw_viewer(self.viewer, self.sim, True)
+        self.gym.write_viewer_image_to_file(self.viewer, path)
+
+    def _record_touch_step(self):
+        rec_dir = self.cfg["env"].get("record_dir", None)
+        if not rec_dir:
+            return
+        T = int(self.cfg["env"].get("record_steps", 400))
+        n_snap = int(self.cfg["env"].get("record_snaps", 4))
+        if not hasattr(self, "_rec"):
+            os.makedirs(rec_dir, exist_ok=True)
+            rng = np.random.default_rng(int(self.cfg["env"].get("record_seed", 0)))
+            seg = T / n_snap
+            snaps = [int(np.clip((k + 0.5) * seg + rng.uniform(-0.3, 0.3) * seg, 8, T - 9)) for k in range(n_snap)]
+            env0 = self.envs[0]
+            origin = self.gym.get_env_origin(env0)
+            obj = self.object_pos[0].detach().cpu().numpy()
+            target = np.array([obj[0] - origin.x, obj[1] - origin.y, obj[2] - origin.z])
+            cam = [float(v) for v in self.cfg["env"].get("record_cam", [0.20, -45.0, 35.0])]  # [dist m, az deg, el deg]
+            self._rec = {"t": 0, "sensed": [], "force": [], "reset": [], "snaps": snaps,
+                         "cell_force": [], "cell_fn": [], "thresh": [],
+                         "target": target, "cam": cam}
+            name = self.used_training_objects[int(self.object_class_indices[0])]
+            self._rec["object"] = name
+            print(f"[record] env 0 object: {name}; snapshots at steps {snaps}; camera {cam}; writing to {rec_dir}")
+            if self.cfg["env"].get("record_cam_test", False) and self.viewer:
+                dists = self.cfg["env"].get("record_test_dists", [0.15, 0.22])
+                azs = self.cfg["env"].get("record_test_azs", [-135, -90, -45, 0, 45, 90, 135, 180])
+                els = self.cfg["env"].get("record_test_els", [35])
+                for dist in dists:
+                    for az in azs:
+                        for el in els:
+                            self._set_record_camera(target, float(dist), float(az), float(el))
+                            self._save_viewer_image(os.path.join(
+                                rec_dir, f"cam_d{float(dist):.2f}_az{int(az):+04d}_el{int(el):02d}.png"))
+                print(f"[record] camera test: saved {len(dists) * len(azs) * len(els)} images to {rec_dir}. Exiting.")
+                import sys
+                sys.exit(0)
+        r = self._rec
+        t = r["t"]
+        if t >= T:
+            return
+        # +task.env.record_contact_pairs=N (CPU pipeline only): print which body pairs push on the pad cells
+        # during the first N steps, summed contact impulse per pair, then exit.
+        n_pair_steps = int(self.cfg["env"].get("record_contact_pairs", 0))
+        if n_pair_steps > 0:
+            if t == 0:
+                env0 = self.envs[0]
+                names = list(self.gym.get_actor_rigid_body_names(env0, self.arm_hands[0]))
+                names += ["object:" + n for n in self.gym.get_actor_rigid_body_names(env0, self.gym.find_actor_handle(env0, "object"))]
+                self._pair_names, self._pairs = names, {}
+                cell_set = set(self.contact_sensor_names)
+                self._cell_ids = {i for i, n in enumerate(names) if n in cell_set}
+                print(f"[pairs] collecting contact pairs on env 0 for {n_pair_steps} steps")
+            names = self._pair_names
+            for c in self.gym.get_env_rigid_contacts(self.envs[0]):
+                b0, b1, lam = int(c["body0"]), int(c["body1"]), float(c["lambda"])
+                if lam <= 0 or not ({b0, b1} & self._cell_ids):
+                    continue
+                n0 = names[b0] if 0 <= b0 < len(names) else f"body{b0}"
+                n1 = names[b1] if 0 <= b1 < len(names) else f"body{b1}"
+                key = tuple(sorted((n0, n1)))
+                self._pairs[key] = self._pairs.get(key, 0.0) + lam
+            if t == n_pair_steps - 1:
+                print(f"[pairs] contact impulse summed over {n_pair_steps} steps, pairs involving a pad cell:")
+                for (a, b), lam in sorted(self._pairs.items(), key=lambda kv: -kv[1]):
+                    print(f"  {a:24s} <-> {b:24s} {lam:12.4f}")
+                shapes = self.gym.get_actor_rigid_shape_properties(self.envs[0], self.arm_hands[0])
+                ranges = self.gym.get_actor_rigid_body_shape_indices(self.envs[0], self.arm_hands[0])
+                print("[pairs] shape filters per body:")
+                for i, n in enumerate(names[:len(ranges)]):
+                    rg = ranges[i]
+                    if rg.count:
+                        print(f"  {n:24s} {[shapes[j].filter for j in range(rg.start, rg.start + rg.count)]}")
+                import sys
+                sys.exit(0)
+        # pad force as the policy pipeline computed it this step (vector sum of cells, see _pad_contact_forces)
+        r["force"].append(torch.norm(self.last_pad_forces[0], dim=-1).detach().cpu().numpy())
+        cells, f_normal = self._cell_contact_forces()
+        r["cell_force"].append(cells[0].detach().cpu().numpy())    # (16 * n_cells, 3) world frame
+        r["cell_fn"].append(f_normal[0].detach().cpu().numpy())    # (16 * n_cells,) compressive normal
+        r["thresh"].append(self.contact_thresh[0].detach().cpu().numpy())  # (16,) binary threshold this episode
+        r["sensed"].append(self.sensed_contacts[0].detach().cpu().numpy())
+        # full state of env 0 after this step (for state replay)
+        env0 = self.envs[0]
+        obj_h = self.gym.find_actor_handle(env0, "object")
+        r.setdefault("dof_pos", []).append(self.arm_hand_dof_pos[0].detach().cpu().numpy())
+        r.setdefault("dof_vel", []).append(self.arm_hand_dof_vel[0].detach().cpu().numpy())
+        r.setdefault("obj_state", []).append(self.root_state_tensor[int(self.object_indices[0])].detach().cpu().numpy())
+        r.setdefault("targets", []).append(self.cur_targets[0].detach().cpu().numpy())
+        r.setdefault("obj_mass", []).append(self.gym.get_actor_rigid_body_properties(env0, obj_h)[0].mass)
+        r.setdefault("friction", []).append(self.gym.get_actor_rigid_shape_properties(env0, self.arm_hands[0])[0].friction)
+        r["reset"].append(bool(self.reset_buf[0].item()))
+        if t in r["snaps"] and self.viewer:
+            self._set_record_camera(r["target"], *r["cam"])
+            self._save_viewer_image(os.path.join(rec_dir, f"snap_{t:04d}.png"))
+        # +task.env.record_gif=True: also save a frame every record_gif_stride steps (for plot_touch_rollout.py --gif)
+        gif_stride = int(self.cfg["env"].get("record_gif_stride", 2))
+        if self.cfg["env"].get("record_gif", False) and self.viewer and t % gif_stride == 0:
+            frame_dir = os.path.join(rec_dir, "frames")
+            os.makedirs(frame_dir, exist_ok=True)
+            self._set_record_camera(r["target"], *r["cam"])
+            self._save_viewer_image(os.path.join(frame_dir, f"frame_{t:04d}.png"))
+        r["t"] = t + 1
+        if r["t"] == T:
+            path = os.path.join(rec_dir, "touch_rollout.npz")
+            np.savez(path, sensed=np.array(r["sensed"]), force=np.array(r["force"]),
+                     cell_force=np.array(r["cell_force"]), cell_fn=np.array(r["cell_fn"]),
+                     thresh=np.array(r["thresh"]), n_cells=self.n_cells,
+                     latency=float(self.latency), sensor_noise=float(self.sensor_noise),
+                     reset=np.array(r["reset"]), snaps=np.array(r["snaps"]),
+                     sensor_names=np.array(self.pad_names), cell_names=np.array(self.contact_sensor_names),
+                     object=r["object"],
+                     dof_pos=np.array(r["dof_pos"]), dof_vel=np.array(r["dof_vel"]),
+                     obj_state=np.array(r["obj_state"]), targets=np.array(r["targets"]),
+                     obj_mass=np.array(r["obj_mass"]), friction=np.array(r["friction"]),
+                     obj_scale=float(self.gym.get_actor_scale(self.envs[0], self.gym.find_actor_handle(self.envs[0], "object"))),
+                     sensor_thresh=float(self.cfg["env"]["sensorThresh"]))
+            print(f"[record] saved {path}. Done; exiting.")
+            import sys
+            sys.exit(0)
 
 
 #####################################################################

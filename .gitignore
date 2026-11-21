@@ -1,3 +1,7 @@
 *.egg-info
 __pycache__
+*.pycruns/
+rollouts/
+pairs_*.txt
+columns_3d_preview.png
 *.pyc
