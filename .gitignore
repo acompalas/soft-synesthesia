@@ -5,3 +5,11 @@ rollouts/
 pairs_*.txt
 columns_3d_preview.png
 *.pyc
+weight_test/
+area_test/
+rollouts/
+force_stats*.npz
+force_stats_*.png
+park_*.png
+runs/
+probe_test/

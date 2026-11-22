@@ -37,6 +37,7 @@ from isaacgym.torch_utils import *
 
 from isaacgymenvs.tasks.base.vec_task import VecTask
 import isaacgymenvs.utils.quat_utils as transform
+from isaacgymenvs.utils.park_skin import ParkSkin, cell_areas_from_urdf
 import torch.nn.functional as F
 import json
 
@@ -187,6 +188,7 @@ class AllegroArmMOAR(VecTask):
             with open(columns_path) as f:
                 columns_reg = json.load(f)
             column_names = columns_reg["names"]
+            self.columns_polygons = dict(zip(columns_reg["names"], columns_reg["polygon_xy_m"]))
             self.asset_files_dict.update({n: "urdf/objects/{}.urdf".format(n) for n in column_names})
             self.object_sets["columns"] = column_names
             # held-out split (columns.json "train"/"test"): policies train on columns_train only,
@@ -262,6 +264,13 @@ class AllegroArmMOAR(VecTask):
 
         self.obs_type = self.cfg["env"]["observationType"]
         self.ablation_mode = self.cfg["env"]["ablation_mode"]
+        # touch model for the policy's 16 touch inputs: "binary" (released baseline) or "park" (EGaIn skin)
+        self.touch_model = self.cfg["env"].get("touch_model", "binary")
+        assert self.touch_model in ("binary", "park"), self.touch_model
+        if self.touch_model == "park":
+            assert self.obs_type == "partial_stack", "touch_model=park is implemented for partial_stack only"
+            assert self.cfg["env"]["sensor"] == "split4", "touch_model=park needs the split robot (sensor=split4)"
+        self.park_skin = None   # built after the assets are loaded (needs the cell areas)
 
         if not (self.obs_type in ["partial_stack", "full_stack", "full_stack_pointcloud", "partial_stack_pointcloud", "full_stack_baoding", "partial_stack_baoding"]):
             raise Exception(
@@ -709,6 +718,8 @@ class AllegroArmMOAR(VecTask):
 
             # add object
             obj_class_indice = np.random.randint(0, len(self.used_training_objects), 1)[0]
+            if self.cfg["env"].get("objects_in_order", False):  # env i gets object i mod N (evaluation)
+                obj_class_indice = i % len(self.used_training_objects)
             rec_obj = self.cfg["env"].get("record_object", None)
             if i == 0 and rec_obj:  # touch-rollout recorder: force env 0's object
                 obj_class_indice = self.used_training_objects.index(rec_obj)
@@ -1095,6 +1106,8 @@ class AllegroArmMOAR(VecTask):
             # we use some randomized threshold.
             # threshold = 0.2 + torch.rand_like(contacts) * self.sensor_thresh
             contacts = torch.where(contacts >= self.contact_thresh, 1.0, 0.0)
+            if self.touch_model == "park":
+                contacts = self._park_readings()
 
             latency_samples = torch.rand_like(self.last_contacts)
             latency = torch.where(latency_samples < self.latency, 1, 0)  # with 0.25 probability, the signal is lagged
@@ -1104,7 +1117,10 @@ class AllegroArmMOAR(VecTask):
             mask = torch.where(mask < self.sensor_noise, 0.0, 1.0)
 
             # random mask out the signal.
-            sensed_contacts = torch.where(self.last_contacts > 0.1, mask * self.last_contacts, self.last_contacts)
+            if self.touch_model == "park":
+                sensed_contacts = mask * self.last_contacts   # same dropout, applied to continuous readings
+            else:
+                sensed_contacts = torch.where(self.last_contacts > 0.1, mask * self.last_contacts, self.last_contacts)
             if self.use_disable:
                 sensed_contacts[:, self.disable_sensor_idxes] = 0
             # Do some data augmentation to the contact....
@@ -2008,10 +2024,81 @@ class AllegroArmMOAR(VecTask):
                                                     contact_idx, gymapi.MESH_VISUAL_AND_COLLISION,
                                                     gymapi.Vec3(*color))
 
+        self._print_env_objects()
         self._run_state_replay()
         self._record_touch_step()
+        self._force_stats_step()
+
+    # Enabled with +task.env.force_stats=<control steps>. Collects every env's 16 pad force norms
+    # (the force the binary threshold and the Park model see) for that many steps, prints their
+    # distribution over touched pad-steps, saves the touched forces per pad (excluding the 3 steps
+    # after a reset) to +task.env.force_stats_out (default force_stats.npz) for plot_force_stats.py,
+    # then exits. The eval player stops after 500 games, so keep steps * num_envs modest.
+    def _force_stats_step(self):
+        n = int(self.cfg["env"].get("force_stats", 0))
+        if n <= 0:
+            return
+        if not hasattr(self, "_fstats"):
+            self._fstats, self._fsettled = [], []
+        self._fstats.append(torch.norm(self.last_pad_forces, dim=-1).detach().to(torch.float16))
+        self._fsettled.append((self.progress_buf > 3).detach().clone())   # not within 3 steps of a reset
+        if len(self._fstats) < n:
+            return
+        f = torch.stack(self._fstats).float()                        # (T, num_envs, 16)
+        settled = torch.stack(self._fsettled).unsqueeze(-1).expand_as(f)
+        names = [p.replace("_fsr", "") for p in self.pad_names]
+        qs = torch.tensor([0.5, 0.9, 0.99, 0.999], device=f.device)
+
+        def quant(x, q):
+            x = x[torch.randperm(x.numel(), device=x.device)[:2_000_000]] if x.numel() > 2_000_000 else x
+            return torch.quantile(x, q)
+
+        for label, keep in (("all steps", torch.ones_like(settled)), ("excluding 3 steps after reset", settled)):
+            touched = (f > 0.1) & keep
+            t = f[touched]
+            q = quant(t, qs).tolist()
+            print(f"\n[force-stats] {self.num_envs} envs x {n} steps, {label}: touched pad-steps (> 0.1 N) {t.numel()} "
+                  f"({t.numel() / keep.sum().item():.1%})")
+            print(f"[force-stats]   pad force N: median {q[0]:.2f}, p90 {q[1]:.2f}, p99 {q[2]:.2f}, p99.9 {q[3]:.2f}, "
+                  f"max {t.max().item():.1f}")
+            print("[force-stats]   share of touched pad-steps above: " +
+                  ", ".join(f"{th} N {(t > th).float().mean().item():.2%}" for th in (2, 5, 10, 20, 50, 100)))
+            p50 = [quant(f[..., i][touched[..., i]], 0.5).item() if touched[..., i].any() else 0.0 for i in range(16)]
+            print("[force-stats]   per-pad median N: " + ", ".join(f"{nm} {v:.1f}" for nm, v in zip(names, p50)))
+        out = self.cfg["env"].get("force_stats_out", "force_stats.npz")    # settled touched forces per pad
+        touched = (f > 0.1) & settled
+        per_pad = {}
+        for i in range(16):
+            x = f[..., i][touched[..., i]]
+            x = x[torch.randperm(x.numel(), device=x.device)[:200_000]] if x.numel() > 200_000 else x
+            per_pad[f"pad{i}"] = x.cpu().numpy()
+        np.savez(out, pads=np.array(self.pad_names), num_envs=self.num_envs, steps=n,
+                 touched_share=float(touched.sum().item() / settled.sum().item()), **per_pad)
+        print(f"[force-stats] saved {os.path.abspath(out)}")
+        raise SystemExit(0)
 
     # ------------------------------------------------------------------ split-pad sensing
+    def _park_readings(self):
+        """(num_envs, 16) Park skin readings in [0, 1] from the cells' compressive normal forces.
+        Each pad's p_star is scaled by its per-episode binary threshold / 1.5 (0.67-1.33x), so
+        both conditions get the same per-pad calibration variation (task.env.park_calib=False to disable)."""
+        if self.park_skin is None:
+            urdf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../assets",
+                                self.robot_asset_files_dict[self.cfg["env"]["sensor"]])
+            env = self.cfg["env"]
+            self.park_skin = ParkSkin(cell_areas_from_urdf(urdf, self.contact_sensor_names), n_cells=self.n_cells,
+                                      E=float(env.get("park_E", 69e3)), nu=float(env.get("park_nu", 0.5)),
+                                      w=float(env.get("park_w", 200e-6)), h=float(env.get("park_h", 300e-6)),
+                                      alpha=float(env.get("park_alpha", 0.9)), device=self.device)
+            print(f"[park] p_star {self.park_skin.p_star / 1e3:.1f} kPa, alpha {self.park_skin.alpha}, "
+                  f"calibration scaling {'on' if env.get('park_calib', True) else 'off'}")
+        _, f_normal = self._cell_contact_forces()
+        scale = None
+        if self.cfg["env"].get("park_calib", True):
+            # contact_thresh is 0 until an env is first reset; use scale 1 there (avoids p_star = 0)
+            scale = torch.where(self.contact_thresh > 0, self.contact_thresh / 1.5, torch.ones_like(self.contact_thresh))
+        return self.park_skin.pad_readings(f_normal, scale)
+
     def _pad_contact_forces(self):
         """(num_envs, 16, 3) net contact force per pad. With split pads this is the vector sum of the
         pad's cells, which equals the net force the unsplit pad body would report."""
@@ -2039,6 +2126,26 @@ class AllegroArmMOAR(VecTask):
         out = allc[:, self.critic_body_indices, :].clone()
         out[:, self.critic_pad_slots, :] = self._pad_contact_forces()
         return out
+
+    # ------------------------------------------------------------------ object printout
+    # +task.env.print_objects=True: once, list each env's object, scale and size (columns only).
+    def _print_env_objects(self):
+        if not self.cfg["env"].get("print_objects", False) or getattr(self, "_objects_printed", False):
+            return
+        self._objects_printed = True
+        th = np.linspace(0, np.pi, 180, endpoint=False)
+        dirs = np.stack([np.cos(th), np.sin(th)], 1)
+        print(f"[objects] {'env':>4s} {'object':10s} {'scale':>5s} {'narrowest mm':>12s} {'widest mm':>9s} {'sides':>5s}")
+        for e in range(min(self.num_envs, 64)):
+            name = self.used_training_objects[int(self.object_class_indices[e])]
+            scale = self.gym.get_actor_scale(self.envs[e], self.gym.find_actor_handle(self.envs[e], "object"))
+            poly = getattr(self, "columns_polygons", {}).get(name)
+            if poly is None:
+                print(f"[objects] {e:4d} {name:10s} {scale:5.2f}")
+                continue
+            w = np.ptp(np.array(poly) @ dirs.T, axis=0) * 1000 * scale
+            n = len(poly)
+            print(f"[objects] {e:4d} {name:10s} {scale:5.2f} {w.min():12.1f} {w.max():9.1f} {n if n <= 8 else 'smooth':>5}")
 
     # ------------------------------------------------------------------ state replay
     # +task.env.replay_file=<touch_rollout.npz from the recorder> +task.env.replay_out=<out.npz>
@@ -2234,7 +2341,11 @@ class AllegroArmMOAR(VecTask):
                      obj_state=np.array(r["obj_state"]), targets=np.array(r["targets"]),
                      obj_mass=np.array(r["obj_mass"]), friction=np.array(r["friction"]),
                      obj_scale=float(self.gym.get_actor_scale(self.envs[0], self.gym.find_actor_handle(self.envs[0], "object"))),
-                     sensor_thresh=float(self.cfg["env"]["sensorThresh"]))
+                     sensor_thresh=float(self.cfg["env"]["sensorThresh"]),
+                     touch_model=self.touch_model,
+                     park_alpha=float(self.cfg["env"].get("park_alpha", 0.9)),
+                     park_E=float(self.cfg["env"].get("park_E", 69e3)),
+                     park_calib=bool(self.cfg["env"].get("park_calib", True)))
             print(f"[record] saved {path}. Done; exiting.")
             import sys
             sys.exit(0)

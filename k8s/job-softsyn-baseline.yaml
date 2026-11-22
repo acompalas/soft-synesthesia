@@ -1,11 +1,11 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: anderson-softsyn-pilot
+  name: anderson-softsyn-baseline
   namespace: erl-ucsd-supp
 spec:
   backoffLimit: 0
-  activeDeadlineSeconds: 57600        # hard stop after 16 h (3000 epochs at ~14 s/epoch is ~12 h)
+  activeDeadlineSeconds: 259200        # hard stop after 72 h (resume from the last checkpoint if needed)
   template:
     spec:
       restartPolicy: Never
@@ -35,16 +35,19 @@ spec:
           export PYTHONUNBUFFERED=1
           source /data/softsyn_env.sh
           cd /data/soft-synesthesia && git pull --ff-only && git log --oneline -1
+          test -f assets/urdf/xarm6/xarm6_allegro_right_fsr_2023_thin_split4.urdf
           mkdir -p /data/logs
-          nvidia-smi --query-gpu=name,memory.total --format=csv | tee /data/logs/pilot_gpu.txt
+          nvidia-smi --query-gpu=name,memory.total --format=csv | tee /data/logs/baseline_gpu.txt
+          # GPU memory every 5 min in the background
+          (while true; do nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader >> /data/logs/baseline_mem.txt; sleep 300; done) &
           python ./isaacgymenvs/train.py headless=True wandb_activate=False \
-            task=AllegroArmMOAR task.env.objSet=columns task.env.axis=z \
+            task=AllegroArmMOAR task.env.objSet=columns_train task.env.axis=z task.env.sensor=split4 \
             task.env.observationType=partial_stack task.env.ablation_mode=no-pc task.env.legacy_obs=True \
             task.env.numEnvs=8192 \
             train.params.config.minibatch_size=16384 train.params.config.central_value_config.minibatch_size=16384 \
-            train.params.config.max_epochs=3000 \
-            experiment=pilot-binary-unsplit train.params.config.user_prefix=pilot \
-            2>&1 | tee /data/logs/pilot.log
+            train.params.config.max_epochs=5000 seed=42 \
+            experiment=baseline-binary-split4 train.params.config.user_prefix=binary \
+            2>&1 | tee /data/logs/baseline.log
           echo "=== DONE"
         resources:
           limits:
