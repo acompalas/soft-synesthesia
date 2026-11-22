@@ -2089,9 +2089,11 @@ class AllegroArmMOAR(VecTask):
             self.park_skin = ParkSkin(cell_areas_from_urdf(urdf, self.contact_sensor_names), n_cells=self.n_cells,
                                       E=float(env.get("park_E", 69e3)), nu=float(env.get("park_nu", 0.5)),
                                       w=float(env.get("park_w", 200e-6)), h=float(env.get("park_h", 300e-6)),
-                                      alpha=float(env.get("park_alpha", 0.9)), device=self.device)
+                                      alpha=float(env.get("park_alpha", 0.9)),
+                                      log_eps=env.get("park_log_eps", None), device=self.device)
             print(f"[park] p_star {self.park_skin.p_star / 1e3:.1f} kPa, alpha {self.park_skin.alpha}, "
-                  f"calibration scaling {'on' if env.get('park_calib', True) else 'off'}")
+                  f"calibration scaling {'on' if env.get('park_calib', True) else 'off'}, readout "
+                  f"{'linear' if self.park_skin.log_eps is None else f'log, eps {self.park_skin.log_eps}'}")
         _, f_normal = self._cell_contact_forces()
         scale = None
         if self.cfg["env"].get("park_calib", True):
@@ -2345,6 +2347,7 @@ class AllegroArmMOAR(VecTask):
                      touch_model=self.touch_model,
                      park_alpha=float(self.cfg["env"].get("park_alpha", 0.9)),
                      park_E=float(self.cfg["env"].get("park_E", 69e3)),
+                     park_log_eps=float(self.cfg["env"].get("park_log_eps") or 0.0),   # 0 = linear readout
                      park_calib=bool(self.cfg["env"].get("park_calib", True)))
             print(f"[record] saved {path}. Done; exiting.")
             import sys

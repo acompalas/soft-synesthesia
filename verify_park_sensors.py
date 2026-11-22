@@ -59,8 +59,9 @@ def main():
     ps = load_module()
     areas = np.array(ps.cell_areas_from_urdf(URDF, cell_names))
     E = float(d["park_E"]) if "park_E" in d.files else 69e3
-    skin = ps.ParkSkin(areas, n_cells=4, E=E, alpha=float(d["park_alpha"]))
-    print(f"skin E = p* = {skin.p_star / 1e3:.0f} kPa")
+    eps = float(d["park_log_eps"]) if "park_log_eps" in d.files else 0.0
+    skin = ps.ParkSkin(areas, n_cells=4, E=E, alpha=float(d["park_alpha"]), log_eps=eps if eps > 0 else None)
+    print(f"skin E = p* = {skin.p_star / 1e3:.0f} kPa, readout {'linear' if eps <= 0 else f'log, eps {eps}'}")
     scale = None
     if bool(d["park_calib"]):
         th = torch.as_tensor(thresh, dtype=torch.float32)
@@ -81,11 +82,10 @@ def main():
     loaded = (fn4 > CELL_N).sum(-1)
     p_mean = pad_force / a4.sum(-1)[None] / 1e3                         # kPa
     cell_p = fn4 / a4[None] / 1e3
-    sat = (cell_p >= skin.alpha * skin.p_star / 1e3 * 0.67).any(-1)      # at the cap for the lowest calibration
-    dr = sensed * skin.g_max
+    dr = skin.dR_from_reading(sensed)                                   # pad dR/R0
     print(f"[2] touched pad-steps: {int(touched.sum())} of {touched.size}; readings when touched: "
           f"median {np.median(sensed[touched]) if touched.any() else float('nan'):.3f}, "
-          f"max {sensed.max():.3f} (1.0 = cap); pad-steps with a cell possibly at the cap: {int((sat & touched).sum())}")
+          f"max {sensed.max():.3f} (1.0 = cap); touched pad-steps at the cap: {(sensed[touched] >= 0.999).mean():.1%}")
 
     PMAX = 80 * skin.p_star / 69e3                                        # same range relative to p*
     p_fine = np.linspace(0, PMAX, 400)

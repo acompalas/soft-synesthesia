@@ -2,6 +2,8 @@
 
 The checks behind the touch sensors in the report. Run all of them from the repo root. The Park skin is Dragon Skin 20 (E = p* = 338 kPa) unless `--E` is given; Park's own EcoFlex 00-30 is `--E 69e3`.
 
+The policy reads each pad through a log readout, r = log(1 + g/ε) / log(1 + g_max/ε) with g = ΔR/R0 (`+task.env.park_log_eps`). This keeps typical touches visible next to saturated ones after input normalisation. The model tests check ΔR/R0 itself.
+
 ## Park skin model
 
 | Test | What it shows | Command | Output |
@@ -15,6 +17,7 @@ The checks behind the touch sensors in the report. Run all of them from the repo
 
 | Test | What it shows | Command | Output |
 |---|---|---|---|
+| Signal visibility | How far a touch moves each policy input after normalisation, Park (linear and log readouts) vs binary. This is why the readout is logarithmic. | `python signal_scale.py rollouts/park_check/touch_rollout.npz` | printout |
 | Pad forces in rollouts | Distribution of pad forces under the trained policy, against the binary threshold and each skin's range. This is why the skin is Dragon Skin 20. | eval with `+task.env.force_stats=30` (see the `plot_force_stats.py` docstring), then `python plot_force_stats.py force_stats.npz` | `force_stats_*.png` |
 
 ## Split-pad binary baseline
