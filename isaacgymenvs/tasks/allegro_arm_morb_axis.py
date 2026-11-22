@@ -1998,10 +1998,50 @@ class AllegroArmMOAR(VecTask):
             if color_cells:
                 cell_mag = torch.norm(self.contact_tensor.reshape(-1, self.num_bodies, 3)[:, self.sensor_handle_indices, :],
                                       dim=-1).cpu().numpy()
+            # +task.env.touch_debug=True: colour each pad by what is behind its reading and print env 0's
+            # active pads. Run with task.env.latency=0 task.env.sensorNoise=0 so the colour is this step.
+            #   red     reading 0
+            #   yellow  reading > 0, pad force < 1.5 N (light touch, binary would not fire)
+            #   green   pad force >= 1.5 N and the object is near the pad
+            #   magenta reading > 0 but the object is far from the pad (hand touching itself)
+            touch_debug = self.cfg["env"].get("touch_debug", False)
+            if touch_debug:
+                pad_f = torch.norm(self.last_pad_forces, dim=-1).cpu().numpy()                      # (N, 16)
+                pad_pos = self.rigid_body_states[:, self.sensor_handle_indices, 0:3].reshape(
+                    self.num_envs, 16, self.n_cells, 3).mean(2)
+                obj_d = torch.norm(pad_pos - self.object_pos[:, None, :], dim=-1).cpu().numpy()   # (N, 16) m
+                far = float(self.cfg["env"].get("touch_debug_far", 0.07))
+                if not hasattr(self, "_tdbg_t"):
+                    self._tdbg_t, self._tdbg_n = 0, np.zeros(5)
+                self._tdbg_t += 1
+                on_all = self.debug_contacts[:, :16] > 0
+                self_c = on_all & (obj_d > far)
+                strong = pad_f >= 1.5
+                # Park on, Park on & object far, binary-level (>= 1.5 N), binary-level & object far, pad-steps
+                self._tdbg_n += [on_all.sum(), self_c.sum(), strong.sum(), (strong & (obj_d > far)).sum(), on_all.size]
+                if self._tdbg_t % 100 == 0:
+                    n = self._tdbg_n
+                    print(f"[touch] all envs, {self._tdbg_t} steps: Park on {n[0] / n[4]:.1%} of pad-steps, of which object "
+                          f"far {n[1] / max(n[0], 1):.0%}; binary-level (>= 1.5 N) {n[2] / n[4]:.1%} of pad-steps, of which "
+                          f"object far {n[3] / max(n[2], 1):.0%}")
+                if self._tdbg_t % 10 == 0:
+                    on = np.where(self.debug_contacts[0, :16] > 0)[0]
+                    print(f"[touch] step {self._tdbg_t}: " + (", ".join(
+                        f"{self.pad_names[j].replace('_fsr', '')} r={self.debug_contacts[0, j]:.2f} "
+                        f"F={pad_f[0, j]:.1f}N obj {obj_d[0, j] * 100:.0f}cm" for j in on) or "no pads on"))
             for env in range(len(self.envs)):
                 for i, contact_idx in enumerate(list(self.sensor_handle_indices)):
-
-                    if self.debug_contacts[env, i // self.n_cells] > 0.0:
+                    j = i // self.n_cells
+                    if touch_debug:
+                        if self.debug_contacts[env, j] <= 0.0:
+                            color = gymapi.Vec3(1.0, 0.0, 0.0)
+                        elif obj_d[env, j] > far:
+                            color = gymapi.Vec3(1.0, 0.0, 1.0)
+                        elif pad_f[env, j] < 1.5:
+                            color = gymapi.Vec3(1.0, 0.85, 0.0)
+                        else:
+                            color = gymapi.Vec3(0.0, 1.0, 0.0)
+                    elif self.debug_contacts[env, j] > 0.0:
                         color = gymapi.Vec3(0.0, 1.0, 0.0)
                     elif color_cells and cell_mag[env, i] > float(self.cfg["env"].get("color_cells_min", 0.05)):
                         color = gymapi.Vec3(1.0, 0.85, 0.0)
