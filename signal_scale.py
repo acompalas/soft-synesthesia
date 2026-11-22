@@ -5,7 +5,8 @@ matters is how far a touch moves an input in units of that input's std. Binary t
 rollout (threshold 1.5 N on the pad force) is the reference.
 
 Input: a touch_rollout.npz recorded with touch_model=park (see verify_park_sensors.py). Prints the
-current readout and candidate log readouts r = log(1 + g / eps) / log(1 + g_max / eps), g = pad dR/R0.
+current readout and candidate log readouts r = max(0, log(g / eps)) / log(g_max / eps), g = pad dR/R0
+(0 below the readout resolution eps).
 
 Usage:
   python signal_scale.py rollouts/park_check/touch_rollout.npz
@@ -18,7 +19,8 @@ G_MAX = 9.0
 d = np.load(sys.argv[1])
 s, f = d["sensed"], d["force"]                     # (T, 16) policy readings 0..1, pad force norms N
 eps_rec = float(d["park_log_eps"]) if "park_log_eps" in d.files else 0.0
-g = s * G_MAX if eps_rec <= 0 else eps_rec * np.expm1(s * np.log1p(G_MAX / eps_rec))   # pad dR/R0
+g = s * G_MAX if eps_rec <= 0 else np.where(s > 0, eps_rec * np.exp(s * np.log(G_MAX / eps_rec)), 0.0)   # pad dR/R0
+# (with a log readout, readings below eps were already 0 when recorded, so candidates are approximate)
 touched = f >= 0.1
 
 
@@ -37,4 +39,4 @@ b = (f >= 1.5).astype(float)
 describe("binary (tau 1.5 N)", b)
 describe("Park, linear readout", g / G_MAX)
 for eps in (0.03, 0.01, 0.003):
-    describe(f"Park, log readout eps {eps}", np.log1p(g / eps) / np.log1p(G_MAX / eps))
+    describe(f"Park, log readout eps {eps}", np.clip(np.log(np.maximum(g, 1e-12) / eps), 0, None) / np.log(G_MAX / eps))

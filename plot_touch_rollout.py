@@ -1,7 +1,10 @@
 """Figure 7-style plot (Yin et al. 2023) from a recorded touch rollout.
 
-Top row: viewer snapshots of env 0. Bottom: the 16 binary touch signals over the rollout,
-one trace per sensor, with shaded windows marking when each snapshot was taken.
+Top row: viewer snapshots of env 0. Bottom: the 16 touch signals the policy received over the
+rollout, one trace per sensor, with shaded windows marking when each snapshot was taken.
+Binary rollouts show on/off traces. Park rollouts (recorded with touch_model=park) show each pad's
+continuous reading as a filled trace: the policy's readout of dR/R0 (log readout when park_log_eps
+is set), 0 = no load, full height = channel closed.
 
 Input is the directory written by the task recorder (+task.env.record_dir=...):
   touch_rollout.npz, snap_XXXX.png
@@ -22,6 +25,28 @@ import matplotlib.pyplot as plt
 
 COLORS = ["#1f3a93", "#b22222", "#d35400", "#1e8449", "#6c3483"]  # cycled per sensor row
 WIN_HALF = 7  # shaded window half-width in control steps (about 15 steps wide, as in Fig. 7)
+
+
+def signal_info(d):
+    """Title text for the recorded touch model."""
+    model = str(d["touch_model"]) if "touch_model" in d.files else "binary"
+    if model != "park":
+        return False, "Binary touch signals"
+    eps = float(d["park_log_eps"]) if "park_log_eps" in d.files else 0.0
+    E = float(d["park_E"]) if "park_E" in d.files else 69e3
+    readout = f"log readout of dR/R0 (eps {eps:g})" if eps > 0 else "dR/R0 / 9"
+    return True, f"Park skin readings (E = {E / 1e3:.0f} kPa, {readout}; full height = channel closed)"
+
+
+def draw_traces(ax, sensed, park, lw):
+    t = np.arange(sensed.shape[0])
+    for i in range(sensed.shape[1]):
+        c = COLORS[i % len(COLORS)]
+        if park:
+            ax.fill_between(t, i, i + 0.8 * sensed[:, i], color=c, alpha=0.35, lw=0, step="mid")
+            ax.plot(t, i + 0.8 * sensed[:, i], color=c, lw=lw, drawstyle="steps-mid")
+        else:
+            ax.plot(t, i + 0.6 * sensed[:, i], color=c, lw=lw)
 
 
 def center_crop(img, frac):
@@ -54,15 +79,14 @@ def make_gif(args):
     first = center_crop(plt.imread(frames[0]), args.crop)
     im = ax_img.imshow(first)
     ax = fig.add_subplot(gs[1])
-    t = np.arange(T)
-    for i in range(n_sensors):
-        ax.plot(t, i + 0.6 * sensed[:, i], color=COLORS[i % len(COLORS)], lw=0.8)
+    park, label = signal_info(d)
+    draw_traces(ax, sensed, park, 0.8)
     for r in resets:
         ax.axvline(r + 0.5, color="0.4", ls="--", lw=0.8)
     ax.set_xlim(0, T); ax.set_ylim(-0.5, n_sensors + 0.2)
     ax.set_yticks(range(n_sensors)); ax.tick_params(axis="y", labelsize=6)
     ax.set_xlabel("control step (10 Hz)"); ax.set_ylabel("sensor")
-    ax.set_title(f"Binary touch signals, object {d['object']}", fontsize=9)
+    ax.set_title(f"{label}, object {d['object']}", fontsize=8)
     cursor = ax.axvline(0, color="#5b5bff", lw=2, alpha=0.7)
     dots = ax.scatter([], [], s=18, color="k", zorder=5)
 
@@ -70,8 +94,10 @@ def make_gif(args):
     for f, s in zip(frames, steps):
         im.set_data(center_crop(plt.imread(f), args.crop))
         cursor.set_xdata([s, s])
-        on = np.where(sensed[min(s, T - 1)] > 0)[0]
-        dots.set_offsets(np.column_stack([np.full(len(on), s), on + 0.6]) if len(on) else np.empty((0, 2)))
+        row = sensed[min(s, T - 1)]
+        on = np.where(row > 0)[0]
+        dots.set_offsets(np.column_stack([np.full(len(on), s), on + (0.8 * row[on] if park else 0.6)])
+                         if len(on) else np.empty((0, 2)))
         fig.canvas.draw()
         images.append(Image.fromarray(np.asarray(fig.canvas.buffer_rgba())[..., :3]))
     plt.close(fig)
@@ -120,7 +146,8 @@ def main():
         return
 
     d = np.load(os.path.join(args.rec_dir, "touch_rollout.npz"))
-    sensed = d["sensed"]                 # (T, 16) values in {0, 1}
+    sensed = d["sensed"]                 # (T, 16): binary {0, 1}, or Park readings in [0, 1]
+    park, label = signal_info(d)
     resets = np.where(d["reset"])[0]     # steps after which env 0 was reset
     snaps = list(d["snaps"])
     T, n_sensors = sensed.shape
@@ -141,9 +168,7 @@ def main():
                 fontsize=12, color="white", bbox=dict(facecolor="black", alpha=0.4, pad=1, lw=0))
 
     ax = fig.add_subplot(gs[1, :])
-    t = np.arange(T)
-    for i in range(n_sensors):
-        ax.plot(t, i + 0.6 * sensed[:, i], color=COLORS[i % len(COLORS)], lw=1.0)
+    draw_traces(ax, sensed, park, 1.0)
     for k, s in enumerate(snaps):
         ax.axvspan(s - WIN_HALF, s + WIN_HALF, color="#5b5bff", alpha=0.25, lw=0)
         ax.text(s, n_sensors - 0.1, str(k + 1), ha="center", va="bottom", fontsize=9)
@@ -152,11 +177,13 @@ def main():
     ax.set_xlim(0, T)
     ax.set_ylim(-0.5, n_sensors + 0.6)
     ax.set_yticks(range(n_sensors))
+    if "sensor_names" in d.files:
+        ax.set_yticklabels([str(n).replace("_fsr", "") for n in d["sensor_names"]])
     ax.tick_params(axis="y", labelsize=7)
     ax.set_xlabel("control step (10 Hz)")
     ax.set_ylabel("sensor")
     ax.grid(axis="x", color="0.85", lw=0.6)
-    title = f"Binary touch signals, env 0, object {d['object']}"
+    title = f"{label}, env 0, object {d['object']}"
     if len(resets):
         title += " (dashed: episode reset)"
     ax.set_title(title, fontsize=9)

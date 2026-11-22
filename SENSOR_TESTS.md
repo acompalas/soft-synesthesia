@@ -2,7 +2,7 @@
 
 The checks behind the touch sensors in the report. Run all of them from the repo root. The Park skin is Dragon Skin 20 (E = p* = 338 kPa) unless `--E` is given; Park's own EcoFlex 00-30 is `--E 69e3`.
 
-The policy reads each pad through a log readout, r = log(1 + g/ε) / log(1 + g_max/ε) with g = ΔR/R0 (`+task.env.park_log_eps`). This keeps typical touches visible next to saturated ones after input normalisation. The model tests check ΔR/R0 itself.
+The policy reads each pad through a log readout with resolution ε, r = max(0, log(g/ε)) / log(g_max/ε) with g = ΔR/R0 (`+task.env.park_log_eps`). This keeps typical touches visible next to saturated ones after input normalisation, and reads 0 below the resolution (about 0.2–0.4 N of pad force for Dragon Skin 20). The model tests check ΔR/R0 itself. `diagnose_park_firing.py` breaks a rollout's "on" readings down by the pad force behind them.
 
 ## Park skin model
 

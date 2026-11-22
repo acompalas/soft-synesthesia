@@ -13,11 +13,13 @@ alpha_cell is set so that one cell alone reaching closure saturates the pad (g_k
 a channel closed anywhere reads as closed, whatever the loaded area. Under uniform pressure all
 g_k are equal, so the pad follows Eq. 4 and saturates at x = alpha, as before.
 
-Readout for the policy (log_eps): linear, reading = g_pad / g_max, or logarithmic,
-    reading = log(1 + g_pad / eps) / log(1 + g_max / eps),
-where eps is the smallest resolvable dR/R0. Both are monotonic in g_pad (same information, both in
-[0, 1]); the log readout keeps typical touches visible next to saturated ones after the policy's
-input normalisation. dR_from_reading() inverts either readout.
+Readout for the policy (log_eps): linear, reading = g_pad / g_max, or logarithmic with resolution eps
+(the smallest resolvable dR/R0),
+    reading = max(0, log(g_pad / eps)) / log(g_max / eps),
+i.e. 0 below the resolution and 0..1 from eps up to the cap. The log readout keeps typical touches
+visible next to saturated ones after the policy's input normalisation; below eps (grazing or
+solver-level contact, roughly 0.2-0.4 N of pad force for Dragon Skin 20) it reads 0.
+dR_from_reading() inverts either readout (0 maps to 0).
 
 Defaults are Park et al. 2012: EcoFlex 00-30, E = 69 kPa; nu = 0.5 (assumed in the paper);
 channels 200 um wide x 300 um high (all layers)  ->  p_star = 69 kPa.
@@ -77,11 +79,13 @@ class ParkSkin:
         g_pad = torch.clamp(g.reshape(g.shape[0], self.n_pads, self.n_cells).mean(dim=-1), max=self.g_max)
         if self.log_eps is None:
             return g_pad / self.g_max
-        return torch.log1p(g_pad / self.log_eps) / math.log1p(self.g_max / self.log_eps)
+        return torch.clamp(torch.log(torch.clamp(g_pad, min=1e-12) / self.log_eps), min=0.0) / \
+            math.log(self.g_max / self.log_eps)
 
     def dR_from_reading(self, reading):
         """Pad dR/R0 from readings (inverse of the readout); works on numpy arrays or tensors."""
         if self.log_eps is None:
             return reading * self.g_max
         lib = torch if torch.is_tensor(reading) else np
-        return self.log_eps * lib.expm1(reading * math.log1p(self.g_max / self.log_eps))
+        g = self.log_eps * lib.exp(reading * math.log(self.g_max / self.log_eps))
+        return lib.where(reading > 0, g, 0.0 * g)
