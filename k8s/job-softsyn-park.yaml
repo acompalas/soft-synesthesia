@@ -37,9 +37,9 @@ spec:
           cd /data/soft-synesthesia && git pull --ff-only && git log --oneline -1
           test -f assets/urdf/xarm6/xarm6_allegro_right_fsr_2023_thin_split4.urdf
           mkdir -p /data/logs
-          nvidia-smi --query-gpu=name,memory.total --format=csv | tee /data/logs/baseline_gpu.txt
+          nvidia-smi --query-gpu=name,memory.total --format=csv | tee /data/logs/park_gpu.txt
           # GPU memory every 5 min in the background
-          (while true; do nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader >> /data/logs/baseline_mem.txt; sleep 300; done) &
+          (while true; do nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader >> /data/logs/park_mem.txt; sleep 300; done) &
           python ./isaacgymenvs/train.py headless=True wandb_activate=False \
             task=AllegroArmMOAR task.env.objSet=columns_train task.env.axis=z task.env.sensor=split4 \
             task.env.observationType=partial_stack task.env.ablation_mode=no-pc task.env.legacy_obs=True \
