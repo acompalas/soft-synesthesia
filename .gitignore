@@ -13,3 +13,4 @@ force_stats_*.png
 park_*.png
 runs/
 probe_test/
+*.pth
