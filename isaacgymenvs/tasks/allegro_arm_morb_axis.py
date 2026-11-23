@@ -2284,7 +2284,7 @@ class AllegroArmMOAR(VecTask):
             origin = self.gym.get_env_origin(env0)
             obj = self.object_pos[0].detach().cpu().numpy()
             target = np.array([obj[0] - origin.x, obj[1] - origin.y, obj[2] - origin.z])
-            cam = [float(v) for v in self.cfg["env"].get("record_cam", [0.20, -45.0, 35.0])]  # [dist m, az deg, el deg]
+            cam = [float(v) for v in self.cfg["env"].get("record_cam", [0.40, -45.0, 50.0])]  # [dist m, az deg, el deg]; default = view chosen for Fig. 7
             self._rec = {"t": 0, "sensed": [], "force": [], "reset": [], "snaps": snaps,
                          "cell_force": [], "cell_fn": [], "thresh": [],
                          "target": target, "cam": cam}
@@ -2384,7 +2384,7 @@ class AllegroArmMOAR(VecTask):
                      obj_mass=np.array(r["obj_mass"]), friction=np.array(r["friction"]),
                      obj_scale=float(self.gym.get_actor_scale(self.envs[0], self.gym.find_actor_handle(self.envs[0], "object"))),
                      sensor_thresh=float(self.cfg["env"]["sensorThresh"]),
-                     touch_model=self.touch_model,
+                     touch_model=self.touch_model, cam=np.array(r["cam"]),
                      park_alpha=float(self.cfg["env"].get("park_alpha", 0.9)),
                      park_E=float(self.cfg["env"].get("park_E", 69e3)),
                      park_log_eps=float(self.cfg["env"].get("park_log_eps") or 0.0),   # 0 = linear readout
