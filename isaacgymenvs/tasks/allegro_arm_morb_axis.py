@@ -951,6 +951,7 @@ class AllegroArmMOAR(VecTask):
         inner_prod = rot_vec[:, 0]
         theta_sign = torch.sign(rot_vec[:, 1])
         theta = theta_sign * torch.arccos(inner_prod)
+        self.last_spin_theta = theta.detach()          # rotation about the spin axis this control step [rad]
 
         torque_penalty = (self.torques ** 2).sum(-1)
         work_penalty = (torch.abs(self.torques) * torch.abs(self.dof_vel_finite_diff)).sum(-1)
@@ -2069,6 +2070,57 @@ class AllegroArmMOAR(VecTask):
         self._record_touch_step()
         self._force_stats_step()
         self._record_recon_step()
+        self._record_eval_step()
+
+    # ------------------------------------------------------------------ policy evaluation
+    # +task.env.eval_dir=DIR [+task.env.eval_steps=500]: for every env, measures its FIRST episode:
+    # time to fall (episode length in s; 50 s = never dropped), total rotation about the spin axis [rad],
+    # and whether it ended in a drop. Saves DIR/eval.npz with the object, split and scale of each env,
+    # prints a summary, and exits. Use with +task.env.objects_in_order=True +task.env.player_games=100000.
+    def _record_eval_step(self):
+        out_dir = self.cfg["env"].get("eval_dir", None)
+        if not out_dir:
+            return
+        T = int(self.cfg["env"].get("eval_steps", 500))
+        ctrl_dt = self.sim_params.dt * self.control_freq_inv
+        if not hasattr(self, "_eval"):
+            os.makedirs(out_dir, exist_ok=True)
+            reg = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                              "../../assets/urdf/objects/meshes/columns.json")))
+            names = [self.used_training_objects[int(i)] for i in self.object_class_indices]
+            self._eval = {"t": 0, "names": names,
+                          "split": np.array(["test" if n in reg["test"] else "train" for n in names]),
+                          "scales": np.array([float(self.gym.get_actor_scale(e, self.gym.find_actor_handle(e, "object")))
+                                              for e in self.envs]),
+                          "alive": torch.ones(self.num_envs, dtype=torch.bool, device=self.device),
+                          "steps": torch.zeros(self.num_envs, device=self.device),
+                          "rot": torch.zeros(self.num_envs, device=self.device),
+                          "dropped": torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)}
+            print(f"[eval] {self.num_envs} envs, {len(set(names))} objects, touch model {self.touch_model}; "
+                  f"first episode of every env, up to {T} steps")
+        e = self._eval
+        a = e["alive"]
+        e["steps"] += a.float()
+        e["rot"] += torch.where(a, self.last_spin_theta, torch.zeros_like(self.last_spin_theta))
+        ended = a & (self.reset_buf > 0)
+        e["dropped"] |= ended & (self.progress_buf < self.max_episode_length - 1)
+        e["alive"] = a & ~ended
+        e["t"] += 1
+        if e["t"] < T and e["alive"].any():
+            return
+        ttf = (e["steps"] * ctrl_dt).cpu().numpy()
+        rot = e["rot"].cpu().numpy()
+        drop = e["dropped"].cpu().numpy()
+        np.savez(os.path.join(out_dir, "eval.npz"), object=np.array(e["names"]), split=e["split"], scale=e["scales"],
+                 ttf_s=ttf, rotation_rad=rot, dropped=drop, touch_model=self.touch_model, ctrl_dt=ctrl_dt)
+        for sp in ("train", "test"):
+            m = e["split"] == sp
+            if m.any():
+                print(f"[eval] {sp}: {int(m.sum())} episodes; time to fall {ttf[m].mean():.1f} s (median {np.median(ttf[m]):.1f}); "
+                      f"rotation {np.abs(rot[m]).mean():.2f} rad ({np.abs(rot[m]).mean() / (2 * np.pi):.2f} turns); "
+                      f"dropped {drop[m].mean():.0%}")
+        print(f"[eval] saved {os.path.join(out_dir, 'eval.npz')}. Done; exiting.")
+        raise SystemExit(0)
 
     # ------------------------------------------------------------------ shape-reconstruction rollouts
     # +task.env.recon_dir=DIR [+task.env.recon_steps=500]: records every env for recon_steps control

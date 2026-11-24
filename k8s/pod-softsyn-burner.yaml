@@ -1,0 +1,30 @@
+# Small CPU-only pod that mounts the shared drive, for copying logs and checkpoints off it.
+# No GPU, so it never holds a GPU idle. It stops itself after 6 hours (NRP also removes bare pods after 6 h).
+#   kubectl apply -f k8s/pod-softsyn-burner.yaml -n erl-ucsd-supp
+#   kubectl delete pod anderson-softsyn-burner -n erl-ucsd-supp      # when done
+apiVersion: v1
+kind: Pod
+metadata:
+  name: anderson-softsyn-burner
+  namespace: erl-ucsd-supp
+spec:
+  restartPolicy: Never
+  activeDeadlineSeconds: 21600
+  containers:
+  - name: main
+    image: ubuntu:22.04
+    command: ["bash", "-c", "sleep 21600"]
+    resources:
+      limits:
+        cpu: "1"
+        memory: 2Gi
+      requests:
+        cpu: "1"
+        memory: 2Gi
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: anderson-softsyn-data
