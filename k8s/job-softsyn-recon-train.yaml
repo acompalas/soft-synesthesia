@@ -1,0 +1,75 @@
+# Train the shape-reconstruction CNNs on the three cluster rollout sets, on the drive (no shard download).
+# Submit after all three collection jobs have finished. Results go to
+# /data/soft-synesthesia/models/shape_recon/<set>/seed<k>/ (small: models, results.json, predictions);
+# copy them home with the burner pod. Logs: /data/logs/train_recon_<set>.log
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: anderson-softsyn-recon-train
+  namespace: erl-ucsd-supp
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 14400        # 4 h
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations:
+      - key: "nautilus.io/reservation"
+        operator: "Equal"
+        value: "erl-ucsd"
+        effect: "NoSchedule"
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values: ["NVIDIA-GeForce-RTX-3090", "NVIDIA-GeForce-RTX-4090", "NVIDIA-A10", "NVIDIA-A40", "NVIDIA-L40", "NVIDIA-L40S", "NVIDIA-RTX-A5000", "NVIDIA-RTX-A6000", "NVIDIA-L4", "NVIDIA-A100-PCIE-40GB", "NVIDIA-A100-80GB-PCIe", "NVIDIA-A100-SXM4-80GB", "Tesla-V100-SXM2-32GB", "NVIDIA-TITAN-RTX", "Quadro-RTX-6000", "Quadro-RTX-8000"]
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values: ["nrp-01.laccd.edu", "ry-gpu-02.sdsc.optiputer.net"]
+      containers:
+      - name: main
+        image: nvcr.io/nvidia/cuda:11.8.0-cudnn8-devel-ubuntu20.04
+        command: ["bash", "-c"]
+        args:
+        - |
+          set -eo pipefail
+          export PYTHONUNBUFFERED=1
+          source /data/softsyn_env.sh
+          cd /data/soft-synesthesia && git pull --ff-only && git log --oneline -1
+          mkdir -p rollouts/recon /data/logs
+          for p in "baseline_best baseline_ep4500 baseline" "park_best parkfixed_ep3600 parkfixed" "park_latest parklatest_ep5000 parklatest"; do
+            set -- $p
+            if ! grep -q "done test" /data/logs/recon_$3.log 2>/dev/null; then
+              echo "SKIP $1: collection not finished (/data/logs/recon_$3.log has no 'done test')"; continue
+            fi
+            ln -sfn /data/recon/$2 rollouts/recon/$1
+            echo "== $1 <- /data/recon/$2"
+            bash train_recon.sh $1 2>&1 | tee /data/logs/train_recon_$1.log
+          done
+          ls -R models/shape_recon | grep -c "model_" || true
+          echo "=== DONE"
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+            cpu: "4"
+            memory: 16Gi
+          requests:
+            nvidia.com/gpu: 1
+            cpu: "4"
+            memory: 16Gi
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 8Gi
+      - name: data
+        persistentVolumeClaim:
+          claimName: anderson-softsyn-data

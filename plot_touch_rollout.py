@@ -14,6 +14,7 @@ Usage:
   python plot_touch_rollout.py rollouts/smoke --crop 0.6 --no-show
   python plot_touch_rollout.py rollouts/camtest --cams      # contact sheet of camera-test images
   python plot_touch_rollout.py rollouts/smoke --gif         # animated GIF (needs +task.env.record_gif=True)
+  python plot_touch_rollout.py rollouts/smoke --gif-plain   # the same frames as a GIF with no chart (for slides)
 """
 import argparse
 import glob
@@ -49,6 +50,19 @@ def draw_traces(ax, sensed, park, lw):
             ax.plot(t, i + 0.6 * sensed[:, i], color=c, lw=lw)
 
 
+def out_path(args, default_name, suffix):
+    """--out wins; with --deliver the file goes to the deliverables folder as fig7_<run><suffix>, where <run> is
+    the recording folder's name without a leading fig7_; otherwise default_name inside the recording folder."""
+    if args.out:
+        return args.out
+    if args.deliver:
+        os.makedirs(args.deliver, exist_ok=True)
+        run = os.path.basename(os.path.normpath(args.rec_dir))
+        run = run[5:] if run.startswith("fig7_") else run
+        return os.path.join(args.deliver, "fig7_%s%s" % (run, suffix))
+    return os.path.join(args.rec_dir, default_name)
+
+
 def center_crop(img, frac):
     if frac >= 1.0:
         return img
@@ -56,6 +70,14 @@ def center_crop(img, frac):
     ch, cw = int(h * frac), int(w * frac)
     y0, x0 = (h - ch) // 2, (w - cw) // 2
     return img[y0:y0 + ch, x0:x0 + cw]
+
+
+def square_crop(img):
+    """Centre square of an image (for the landscape layout, where the viewer frame sits left of the chart)."""
+    h, w = img.shape[:2]
+    m = min(h, w)
+    y0, x0 = (h - m) // 2, (w - m) // 2
+    return img[y0:y0 + m, x0:x0 + m]
 
 
 def make_gif(args):
@@ -73,11 +95,17 @@ def make_gif(args):
     steps = [int(os.path.basename(f)[6:10]) for f in frames]
     stride = steps[1] - steps[0] if len(steps) > 1 else 1
 
-    fig = plt.figure(figsize=(7.5, 7.0), dpi=90)
-    gs = fig.add_gridspec(2, 1, height_ratios=[1.25, 1.0], hspace=0.12)
+    if args.landscape:                                 # frame (square) on the left, chart on the right
+        prep = lambda f: square_crop(center_crop(plt.imread(f), args.crop))
+        fig = plt.figure(figsize=(12.8, 5.6), dpi=90)
+        gs = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.35], wspace=0.08, left=0.01, right=0.97,
+                              top=0.92, bottom=0.11)
+    else:
+        prep = lambda f: center_crop(plt.imread(f), args.crop)
+        fig = plt.figure(figsize=(7.5, 7.0), dpi=90)
+        gs = fig.add_gridspec(2, 1, height_ratios=[1.25, 1.0], hspace=0.12)
     ax_img = fig.add_subplot(gs[0]); ax_img.axis("off")
-    first = center_crop(plt.imread(frames[0]), args.crop)
-    im = ax_img.imshow(first)
+    im = ax_img.imshow(prep(frames[0]))
     ax = fig.add_subplot(gs[1])
     park, label = signal_info(d)
     draw_traces(ax, sensed, park, 0.8)
@@ -92,7 +120,7 @@ def make_gif(args):
 
     images = []
     for f, s in zip(frames, steps):
-        im.set_data(center_crop(plt.imread(f), args.crop))
+        im.set_data(prep(f))
         cursor.set_xdata([s, s])
         row = sensed[min(s, T - 1)]
         on = np.where(row > 0)[0]
@@ -102,8 +130,28 @@ def make_gif(args):
         images.append(Image.fromarray(np.asarray(fig.canvas.buffer_rgba())[..., :3]))
     plt.close(fig)
 
-    out = args.out or os.path.join(args.rec_dir, "touch_rollout.gif")
+    out = (out_path(args, "touch_rollout_landscape.gif", "_landscape.gif") if args.landscape
+           else out_path(args, "touch_rollout.gif", ".gif"))
     duration_ms = int(round(100 * stride / args.gif_speed))  # one control step = 100 ms
+    images[0].save(out, save_all=True, append_images=images[1:], duration=duration_ms, loop=0, optimize=True)
+    print(f"saved {os.path.abspath(out)} ({len(images)} frames, {duration_ms} ms each)")
+
+
+def make_plain_gif(args):
+    """The recorded viewer frames alone, at the same playback speed as --gif (no touch chart)."""
+    from PIL import Image
+
+    frames = sorted(glob.glob(os.path.join(args.rec_dir, "frames", "frame_*.png")))
+    if not frames:
+        raise SystemExit("no frames found; record with +task.env.record_gif=True")
+    steps = [int(os.path.basename(f)[6:10]) for f in frames]
+    stride = steps[1] - steps[0] if len(steps) > 1 else 1
+    images = []
+    for f in frames:
+        im = center_crop(plt.imread(f), args.crop)[..., :3]       # PNGs load as floats in [0, 1]
+        images.append(Image.fromarray(im if im.dtype == np.uint8 else (im * 255).round().astype(np.uint8)))
+    out = out_path(args, "touch_rollout_plain.gif", "_plain.gif")
+    duration_ms = int(round(100 * stride / args.gif_speed))   # one control step = 100 ms
     images[0].save(out, save_all=True, append_images=images[1:], duration=duration_ms, loop=0, optimize=True)
     print(f"saved {os.path.abspath(out)} ({len(images)} frames, {duration_ms} ms each)")
 
@@ -119,10 +167,27 @@ def main():
     ap.add_argument("--gif", action="store_true",
                     help="make touch_rollout.gif from frames/ (recorded with +task.env.record_gif=True)")
     ap.add_argument("--gif-speed", type=float, default=1.0, help="playback speed, 1.0 = real time (10 control steps/s)")
+    ap.add_argument("--deliver", nargs="?", const="deliverables/2_touch_rollouts", default=None, metavar="DIR",
+                    help="save to the deliverables folder (default deliverables/2_touch_rollouts) as fig7_<run>*.png/gif")
+    ap.add_argument("--all", action="store_true",
+                    help="make every output in one go: snapshot PNG, GIF with chart, landscape GIF, plain GIF")
+    ap.add_argument("--landscape", action="store_true",
+                    help="with --gif: square viewer frame on the left, touch chart on the right (for slides)")
+    ap.add_argument("--gif-plain", action="store_true",
+                    help="make touch_rollout_plain.gif: the viewer frames only, no touch chart")
     args = ap.parse_args()
-    if not args.show or args.gif:
+    if not args.show or args.gif or args.gif_plain or args.all:
         matplotlib.use("Agg")
 
+    if args.all:
+        args.show = False
+        for gif, land, plain in ((True, False, False), (True, True, False), (False, False, True)):
+            args.gif, args.landscape, args.gif_plain = gif, land, plain
+            (make_plain_gif if plain else make_gif)(args)
+        args.gif = args.landscape = args.gif_plain = False          # fall through to the snapshot PNG
+    if args.gif_plain:
+        make_plain_gif(args)
+        return
     if args.gif:
         make_gif(args)
         return
@@ -188,7 +253,7 @@ def main():
         title += " (dashed: episode reset)"
     ax.set_title(title, fontsize=9)
 
-    out = args.out or os.path.join(args.rec_dir, "touch_rollout.png")
+    out = out_path(args, "touch_rollout.png", ".png")
     fig.savefig(out, dpi=150, bbox_inches="tight")
     print(f"saved {os.path.abspath(out)}")
     if args.show:

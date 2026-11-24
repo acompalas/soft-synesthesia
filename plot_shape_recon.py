@@ -112,8 +112,11 @@ def extrude(ax, xy, height, color):
     xy = np.vstack([xy, xy[:1]])
     sides = [[(*xy[i], 0), (*xy[i + 1], 0), (*xy[i + 1], height), (*xy[i], height)] for i in range(len(xy) - 1)]
     top = [[(x, y, height) for x, y in xy[:-1]]]
-    ax.add_collection3d(Poly3DCollection(sides + top, facecolors=color, edgecolors=color, linewidths=0.2,
-                                         alpha=0.85, shade=True))
+    # Sides (4 vertices each) and top (N vertices) go in separate collections, each as one array:
+    # older matplotlib (python 3.8 env) cannot compute shading normals for a ragged list of polygons.
+    for faces in (np.array(sides, dtype=float), np.array(top, dtype=float)):
+        ax.add_collection3d(Poly3DCollection(faces, facecolors=color, edgecolors=color, linewidths=0.2,
+                                             alpha=0.85, shade=True))
 
 
 def fig_3d(picks, polys, P, signals, height_mm, out):

@@ -31,6 +31,7 @@ import argparse
 import glob
 import json
 import os
+import time
 
 import numpy as np
 import torch
@@ -53,7 +54,7 @@ def shard_paths(items):
 
 def load_shards(paths, signals):
     """Concatenate the fields this run needs from every shard."""
-    keys = ["dof_pos", "radii", "object", "split"] + [TOUCH_KEY[s] for s in signals if s != "none"]
+    keys = ["dof_pos", "radii", "object", "split", "scale"] + [TOUCH_KEY[s] for s in signals if s != "none"]
     parts = {k: [] for k in keys}
     for p in paths:
         with np.load(p) as z:
@@ -64,19 +65,30 @@ def load_shards(paths, signals):
                 v = z[k]
                 if k == "dof_pos":
                     v = v[:, :, HAND].astype(np.float32)           # keep only the 16 hand joints
-                elif k in TOUCH_KEY.values():
-                    v = v.astype(np.float32)
-                parts[k].append(v)
+                parts[k].append(v)                                 # touch stays uint8 / float16 (memory)
     data = {k: np.concatenate(v) for k, v in parts.items()}
     data["object"] = data["object"].astype(str)
     data["split"] = data["split"].astype(str)
     return data
 
 
-def build_inputs(data, signal):
-    """(W, C, L): 16 hand joints, plus 16 touch channels unless signal == 'none'."""
-    x = data["dof_pos"] if signal == "none" else np.concatenate([data["dof_pos"], data[TOUCH_KEY[signal]]], -1)
-    return np.ascontiguousarray(np.transpose(x, (0, 2, 1)))
+def build_inputs(data, signal, fit_idx):
+    """(W, C, L) float16: 16 hand joints normalised with the statistics of the fit windows, plus 16 touch
+    channels unless signal == 'none'. Written in place into one float16 array (no float32 copies of the whole
+    dataset), so the full 57k-window set needs about 0.7 GB here. Batches are converted to float32 on the fly.
+    Touch channels are already in [0, 1] for every signal, so they are left as they are: the same scale for
+    binary and Park, and a pad that is rarely touched in training cannot turn into a huge input at test time."""
+    dof = data["dof_pos"]                                              # (W, L, 16) float32
+    mean = dof[fit_idx].mean(axis=(0, 1))
+    std = np.maximum(dof[fit_idx].std(axis=(0, 1)), JOINT_STD_FLOOR)
+    W, L = dof.shape[:2]
+    C = 16 if signal == "none" else 32
+    x = np.empty((W, C, L), np.float16)
+    for i in range(0, W, 4096):                                        # chunked: no full-size temporaries
+        x[i:i + 4096, :16] = np.transpose((dof[i:i + 4096] - mean) / std, (0, 2, 1))
+        if signal != "none":
+            x[i:i + 4096, 16:] = np.transpose(data[TOUCH_KEY[signal]][i:i + 4096], (0, 2, 1))
+    return x, mean, std
 
 
 # --------------------------------------------------------------------------- model and loss
@@ -126,21 +138,23 @@ def aligned_mse(pred, target):
 
 # --------------------------------------------------------------------------- training
 def run_signal(signal, data, args, device):
-    tr, te = data["split"] == "train", data["split"] == "test"
-    assert tr.any() and te.any(), "need windows from both the train and the test objects"
+    """Train on the train objects minus a few validation objects; report the held-out (test) objects once, at
+    the end. The validation error is printed during training and is what any tuning should look at."""
+    split, objects = data["split"], data["object"]
+    train_objs = sorted(set(objects[split == "train"]))
+    rng = np.random.default_rng(args.seed)
+    val_objs = set(rng.choice(train_objs, size=min(args.val_objects, len(train_objs) - 1), replace=False)) \
+        if args.val_objects > 0 else set()
+    is_val = np.isin(objects, sorted(val_objs))
+    fit_idx = np.where((split == "train") & ~is_val)[0]
+    val_idx = np.where(is_val)[0]
+    te_idx = np.where(split == "test")[0]
+    assert len(fit_idx) and len(te_idx), "need windows from both the train and the test objects"
     y_m = data["radii"].astype(np.float32)                 # outline of each env's (scaled) object [m]
 
-    x = build_inputs(data, signal)
-    # Normalise the joint channels with training statistics. Touch channels are already in [0, 1]
-    # for every signal, so they are left as they are: the same scale for binary and Park, and a pad
-    # that is rarely touched in training cannot turn into a huge input at test time.
-    mean = x[tr, :16].mean(axis=(0, 2), keepdims=True)
-    std = np.maximum(x[tr, :16].std(axis=(0, 2), keepdims=True), JOINT_STD_FLOOR)
-    x[:, :16] = (x[:, :16] - mean) / std
-
-    unit = float(y_m[tr].mean())                           # train in units of the mean radius
-    xt, yt = torch.from_numpy(x[tr]), torch.from_numpy(y_m[tr] / unit)
-    xv, yv = torch.from_numpy(x[te]), torch.from_numpy(y_m[te] / unit).to(device)
+    x, joint_mean, joint_std = build_inputs(data, signal, fit_idx)
+    unit = float(y_m[fit_idx].mean())                      # train in units of the mean radius
+    y = torch.from_numpy(y_m / unit)
 
     torch.manual_seed(args.seed)
     model = TemporalCNN(x.shape[1]).to(device)
@@ -148,50 +162,70 @@ def run_signal(signal, data, args, device):
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
     gen = torch.Generator().manual_seed(args.seed)
 
-    def predict(xs):
+    def batch_x(idx):
+        return torch.from_numpy(x[idx]).to(device).float()
+
+    def predict(idx):
         model.eval()
         with torch.no_grad():
-            return torch.cat([model(xs[i:i + 4096].to(device)) for i in range(0, len(xs), 4096)])
+            return torch.cat([model(batch_x(idx[i:i + 2048])) for i in range(0, len(idx), 2048)])
+
+    def mean_loss(idx):
+        return aligned_mse(predict(idx), y[idx].to(device))[0].mean().item() if len(idx) else float("nan")
 
     history = []
     for epoch in range(args.epochs):
         model.train()
-        perm = torch.randperm(len(xt), generator=gen)
+        perm = fit_idx[torch.randperm(len(fit_idx), generator=gen).numpy()]
         total = 0.0
         for i in range(0, len(perm), args.batch):
-            b = perm[i:i + args.batch]
-            loss = aligned_mse(model(xt[b].to(device)), yt[b].to(device))[0].mean()
+            b = np.sort(perm[i:i + args.batch])                # sorted indices read faster from the array
+            loss = aligned_mse(model(batch_x(b)), y[b].to(device))[0].mean()
             opt.zero_grad()
             loss.backward()
             opt.step()
             total += loss.item() * len(b)
         sched.step()
-        val = aligned_mse(predict(xv), yv)[0].mean().item()   # printed only; never used to choose anything
-        history.append((total / len(xt), val))
+        val = mean_loss(val_idx)
+        history.append((total / len(fit_idx), val))
         if (epoch + 1) % max(1, args.epochs // 10) == 0:
-            print("  [%s] epoch %3d  train %.4f  held-out %.4f  (units of mean radius^2)"
-                  % (signal, epoch + 1, history[-1][0], val))
+            print("  [%s] epoch %3d  train %.4f  validation %.4f  (units of mean radius^2; %d validation objects)"
+                  % (signal, epoch + 1, history[-1][0], val, len(val_objs)))
 
-    pred = predict(xv)
+    # Save the trained network with what is needed to reuse it on new windows (same input normalisation).
+    torch.save({"state_dict": model.state_dict(), "in_channels": x.shape[1], "signal": signal,
+                "joint_mean": joint_mean, "joint_std": joint_std, "unit_m": unit, "seed": args.seed,
+                "val_objects": sorted(val_objs)}, os.path.join(args.out, "model_%s.pt" % signal))
+
+    yv = y[te_idx].to(device)
+    pred = predict(te_idx)
     loss, shift = aligned_mse(pred, yv)
     mse_mm2 = loss.cpu().numpy() * (unit * 1e3) ** 2        # per held-out window
     # Reference: always predict the mean training outline (what a network learns with no information).
-    mean_outline = torch.from_numpy(y_m[tr].mean(0, keepdims=True) / unit).to(device).expand_as(yv)
+    mean_outline = torch.from_numpy(y_m[fit_idx].mean(0, keepdims=True) / unit).to(device).expand_as(yv)
     ref_mm2 = aligned_mse(mean_outline, yv)[0].cpu().numpy() * (unit * 1e3) ** 2
+    # Size-only reference: the mean training outline at scale 1, multiplied by each window's true object scale.
+    # The hand's grip opening already gives away the size, so this is the bar for having learned SHAPE.
+    sc = data["scale"].astype(np.float32)
+    shape1 = (y_m[fit_idx] / sc[fit_idx, None]).mean(0, keepdims=True)
+    sized = torch.from_numpy(shape1 * sc[te_idx, None] / unit).to(device)
+    size_mm2 = aligned_mse(sized, yv)[0].cpu().numpy() * (unit * 1e3) ** 2
 
-    obj_te = data["object"][te]
+    obj_te = objects[te_idx]
     per_obj = {o: float(np.sqrt(mse_mm2[obj_te == o].mean())) for o in np.unique(obj_te)}
     return {
         "signal": signal,
-        "n_train_windows": int(tr.sum()), "n_test_windows": int(te.sum()),
+        "n_train_windows": int(len(fit_idx)), "n_val_windows": int(len(val_idx)), "n_test_windows": int(len(te_idx)),
+        "val_objects": sorted(val_objs),
         "heldout_mse_mm2": float(mse_mm2.mean()),
         "heldout_rmse_mm": float(np.sqrt(mse_mm2.mean())),
         "mean_outline_mse_mm2": float(ref_mm2.mean()),
+        "sized_mean_outline_mse_mm2": float(size_mm2.mean()),
         "per_object_rmse_mm": per_obj,
         "history": history,
     }, {
         "pred_m": pred.cpu().numpy() * unit,          # predicted outline [m]
-        "true_m": y_m[te],                            # true outline [m]
+        "true_m": y_m[te_idx],                        # true outline [m]
         "shift": shift.cpu().numpy(),                 # roll the TRUE outline by -shift to overlay: np.roll(true, -shift)
         "object": obj_te,
         "mse_mm2": mse_mm2,
@@ -203,11 +237,14 @@ def main():
     ap.add_argument("--data", nargs="+", required=True, help="shard .npz files and/or folders of shards")
     ap.add_argument("--signals", nargs="+", default=["none", "binary", "park"],
                     choices=["none", "binary", "park", "sensed"])
-    ap.add_argument("--out", default="rollouts/shape_recon_results", help="output folder (default is git-ignored)")
+    ap.add_argument("--out", default="models/shape_recon/run",
+                    help="output folder: results.json, predictions_<signal>.npz, model_<signal>.pt (git-ignored)")
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--val-objects", type=int, default=10,
+                    help="train objects held out as validation (for tuning); the test objects are only scored at the end")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -223,7 +260,10 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     summary = []
     for s in args.signals:
+        t0 = time.time()
         res, pred = run_signal(s, data, args, device)
+        res["train_seconds"] = time.time() - t0
+        print("  [%s] %.0f s (%.1f s per epoch)" % (s, res["train_seconds"], res["train_seconds"] / args.epochs))
         np.savez(os.path.join(args.out, "predictions_%s.npz" % s), **pred)
         summary.append(res)
     json.dump({"shards": paths, "seed": args.seed, "epochs": args.epochs, "results": summary},
@@ -235,6 +275,8 @@ def main():
         print("  %-8s %12.2f %10.2f" % (r["signal"], r["heldout_mse_mm2"], r["heldout_rmse_mm"]))
     print("  %-8s %12.2f %10.2f   (always predict the mean training outline)"
           % ("mean", summary[0]["mean_outline_mse_mm2"], np.sqrt(summary[0]["mean_outline_mse_mm2"])))
+    print("  %-8s %12.2f %10.2f   (mean outline x the true object scale: knows the size, not the shape)"
+          % ("sized", summary[0]["sized_mean_outline_mse_mm2"], np.sqrt(summary[0]["sized_mean_outline_mse_mm2"])))
     print("Saved to %s/" % args.out)
 
 
