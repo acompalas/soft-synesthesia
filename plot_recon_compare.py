@@ -324,7 +324,7 @@ def main():
                         help="shape_recon.py output folder for the %s %s set" % (pair, pol))
     ap.add_argument("--none-from", choices=["baseline", "park"], default="baseline",
                     help="which set's joints-only CNN is shown as 'No touch' (default: the baseline set)")
-    ap.add_argument("--objects", nargs="+", default=["col_006", "col_067", "col_110"],
+    ap.add_argument("--objects", nargs="+", default=["col_006", "col_054", "col_110"],
                     help="held-out objects to show (default: the presentation's three; 'auto' = best, median, worst)")
     ap.add_argument("--n", type=int, default=3, help="number of objects when --objects is not given (paper: 3)")
     ap.add_argument("--out", default="deliverables/3_shape_reconstruction")

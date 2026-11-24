@@ -14,3 +14,11 @@ probe_test/
 pairs_*.txt
 results/split_validation/**/*.npz
 cluster_runs/
+models/
+# generated figures (rebuilt by make_deliverables.sh / pdflatex); keep only the code and LaTeX source
+deliverables/
+slides/*.png
+slides/*.pdf
+slides/*.aux
+slides/*.log
+models/

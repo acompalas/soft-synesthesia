@@ -9,6 +9,7 @@
 # file /data/recon/NAME.epoch, e.g. written with
 #   kubectl -n erl-ucsd-supp exec job/anderson-softsyn-recon-NAME -- bash -c 'echo 4000 > /data/recon/NAME.epoch'
 # If no epoch arrives in 2 h the job exits and frees the GPU.
+# MEM (default 24Gi) and SHM (default 16Gi) set the memory request and /dev/shm size, e.g. MEM=16Gi SHM=8Gi.
 set -eo pipefail
 NAME=$1; RUN=$2; EPOCH=$3; EXTRA=${4:-}
 [ -n "$NAME" ] && [ -n "$RUN" ] && [ -n "$EPOCH" ] || { sed -n 2,7p "$0"; exit 1; }
@@ -40,7 +41,7 @@ spec:
                 values: ["NVIDIA-GeForce-RTX-3090", "NVIDIA-GeForce-RTX-4090", "NVIDIA-A10", "NVIDIA-A40", "NVIDIA-L40", "NVIDIA-L40S", "NVIDIA-RTX-A5000", "NVIDIA-RTX-A6000", "NVIDIA-L4", "NVIDIA-A100-PCIE-40GB", "NVIDIA-A100-80GB-PCIe", "NVIDIA-A100-SXM4-80GB", "Tesla-V100-SXM2-32GB", "NVIDIA-TITAN-RTX", "Quadro-RTX-6000", "Quadro-RTX-8000"]
               - key: kubernetes.io/hostname
                 operator: NotIn
-                values: ["nrp-01.laccd.edu", "ry-gpu-02.sdsc.optiputer.net"]
+                values: ["nrp-01.laccd.edu", "ry-gpu-02.sdsc.optiputer.net", "ry-gpu-08.sdsc.optiputer.net"]
       containers:
       - name: main
         image: nvcr.io/nvidia/cuda:11.8.0-cudnn8-devel-ubuntu20.04
@@ -73,11 +74,11 @@ spec:
           limits:
             nvidia.com/gpu: 1
             cpu: "4"
-            memory: 24Gi
+            memory: ${MEM:-24Gi}
           requests:
             nvidia.com/gpu: 1
             cpu: "4"
-            memory: 24Gi
+            memory: ${MEM:-24Gi}
         volumeMounts:
         - name: dshm
           mountPath: /dev/shm
@@ -87,7 +88,7 @@ spec:
       - name: dshm
         emptyDir:
           medium: Memory
-          sizeLimit: 16Gi
+          sizeLimit: ${SHM:-16Gi}
       - name: data
         persistentVolumeClaim:
           claimName: anderson-softsyn-data

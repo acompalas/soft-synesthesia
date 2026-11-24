@@ -16,7 +16,7 @@ rebuilt by `bash make_deliverables.sh` into `deliverables/`; it skips anything w
 
 `<set>` is one of `baseline_latest`, `baseline_best`, `park_latest`, `park_best`.
 
-Presentation objects (held-out): Fig. 7 rotates `col_092` (four-sided); Fig. 9 shows `col_006`, `col_067`, `col_110`.
+Presentation objects (held-out): Fig. 7 rotates `col_067` (the largest, eight-sided); Fig. 9 shows `col_006`, `col_054`, `col_110`.
 The held-out MSE is always over all 25 test objects. Override with `OBJ=<name> bash record_fig7.sh` and
 `RECON_OBJECTS="a b c" bash make_deliverables.sh`.
 

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Rebuild the presentation figures from what is on disk and collect them in deliverables/.
-#   bash make_deliverables.sh
+#   bash make_deliverables.sh              # redraw every figure from the current inputs (overwrites them)
+#   CLEAN=1 bash make_deliverables.sh      # empty deliverables/ first, so no figure from older inputs is left
+#   STRICT=1 bash make_deliverables.sh     # stop if any input is missing (for a full reproduction)
 # Re-run any time: figures whose inputs are missing are skipped with a note, so it can be run again as the
 # cluster rollout sets and their CNN runs come in.
 #
@@ -37,6 +39,7 @@ if [ $missing -ne 0 ]; then
   echo "  (figures for missing inputs are skipped or left blank; STRICT=1 makes this an error)"
 fi
 
+if [ -n "$CLEAN" ]; then rm -rf $D; echo "== CLEAN=1: emptied $D/"; fi
 mkdir -p $D/1_training_curves $D/2_touch_rollouts $D/3_shape_reconstruction
 
 echo "== 1. training curves (Fig. 6 style)"
@@ -64,7 +67,7 @@ for r in baseline_best park_best baseline_latest park_latest; do
 done
 
 echo "== 3. shape reconstruction (Fig. 9 style) and held-out MSE"
-python plot_recon_compare.py --out $D/3_shape_reconstruction --objects ${RECON_OBJECTS:-col_006 col_067 col_110}
+python plot_recon_compare.py --out $D/3_shape_reconstruction --objects ${RECON_OBJECTS:-col_006 col_054 col_110}
 python plot_recon_mse.py --out $D/3_shape_reconstruction/recon_mse.png | tee $D/3_shape_reconstruction/recon_mse_table.txt
 
 echo

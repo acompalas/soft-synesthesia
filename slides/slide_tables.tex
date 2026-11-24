@@ -1,0 +1,103 @@
+% Slide inserts: one tightly cropped PDF page per slide element, for screenshots into Google Slides.
+% Build:  pdflatex slide_tables.tex      (one page per \begin{slide} ... \end{slide})
+\documentclass[multi=slide, border=14pt, 12pt]{standalone}
+\usepackage{amsmath, amssymb, booktabs, array, xcolor}
+\definecolor{bin}{HTML}{1F77B4}
+\definecolor{park}{HTML}{D62728}
+\definecolor{muted}{HTML}{555555}
+\newenvironment{slide}{\begin{varwidth}{30cm}}{\end{varwidth}}
+\usepackage{varwidth}
+\renewcommand{\arraystretch}{1.25}
+
+\begin{document}
+
+% ---------------------------------------------------------------- 1. reward
+\begin{slide}
+\textbf{Reward at every control step} (10 Hz, episode up to 500 steps = 50 s)
+\[
+r_t \;=\; \underbrace{\Delta\theta_z}_{\text{turn about vertical}}
+\;-\; \underbrace{0.1\,\lVert \mathbf v_{\text{obj}} \rVert}_{\text{don't slide it}}
+\;+\; \underbrace{0.1\, r_{\text{near}}}_{\text{fingertips close}}
+\;-\; \underbrace{3{\times}10^{-4}\textstyle\sum_j \tau_j^2}_{\text{torque}}
+\;-\; \underbrace{3{\times}10^{-4}\textstyle\sum_j |\tau_j\,\dot q_j|}_{\text{work}}
+\;-\; \underbrace{50\cdot\mathbf{1}[\text{fall}]}_{\text{dropped}}
+\]
+\color{muted}\small
+$\Delta\theta_z$ is signed: turning the wrong way costs reward.
+Episode ends (``fall'') if the object moves $>10$\,cm from its start in the hand, tilts $>72^\circ$, or slides off.\\
+Cumulative reward $=\sum_t r_t$ over an episode; time to fall (TTF) = seconds until a fall, at most 50\,s.
+\end{slide}
+
+% ---------------------------------------------------------------- 2. sensors
+\begin{slide}
+\begin{tabular}{>{\bfseries}l p{7.6cm} p{10.4cm}}
+\toprule
+ & \textcolor{bin}{Binary pads (baseline)} & \textcolor{park}{Park soft skin (ours)} \\
+\midrule
+Reads & pad force $\ge \tau$ \;$\to$ 1, else 0 & resistance change $\Delta R/R_0$ of liquid-metal channels \\
+Model & $\tau \sim U(1, 2)$\,N per episode & per cell $g=\dfrac{1}{1-p/p^*}-1$, \; $p^*=E=338$\,kPa, fixed (Dragon Skin 20) \\
+Per pad & 1 bit & mean of 4 cells; a closed cell saturates the pad \\
+To policy & 0 or 1 & $\dfrac{\log(g/\varepsilon)}{\log(g_{\max}/\varepsilon)} \in [0,1]$, \; $\varepsilon = 0.003$, \; $g_{\max}=9$ \\
+Both & \multicolumn{2}{l}{16 pads on fingers and palm; latency 0.2, dropout 0.1} \\
+\bottomrule
+\end{tabular}
+\end{slide}
+
+% ---------------------------------------------------------------- 2b. sensor validation
+\begin{slide}
+\begin{tabular}{>{\bfseries}l p{8.0cm} p{8.6cm}}
+\toprule
+\multicolumn{3}{l}{\textbf{Does the simulated skin follow Park's model?} \;(Dragon Skin 20, $p^* = 338$\,kPa)} \\
+\midrule
+Test & Setup & Result \\
+\midrule
+Whole pad & plates of known weight (up to 8\,kg) resting on each of the 13 upward-facing pads & $\Delta R/R_0$ follows Eq.~4 up to $0.58\,p^*$; pad force = plate weight \\
+Single cell & the same plate on one of the 4 cells vs on the whole pad, every pad & one cell reads $\ge$ whole pad in 96--98\% of valid cases; a single cell closes (signal blows up) at $\sim$32\,N (big) / 16\,N (small), the whole pad only at $\sim$117 / 57\,N \\
+In the task & the policy's touch input vs Eq.~4 applied to the simulated cell forces & exact match (both calibrations) \\
+\bottomrule
+\end{tabular}
+\end{slide}
+
+% ---------------------------------------------------------------- 3. policy training setup
+\begin{slide}
+\begin{tabular}{>{\bfseries}l l l}
+\toprule
+\multicolumn{3}{l}{\textbf{Policy training setup} (identical for both sensors)} \\
+\midrule
+Algorithm & PPO, asymmetric actor--critic (rl\_games), Isaac Gym & \\
+Actor & MLP $512\!-\!256\!-\!256$, ELU; Gaussian actions: changes to 22 joint targets & \\
+Actor input & 16 hand joint angles + 16 touch values (+ spin axis), last 4 steps & \\
+Critic & MLP $512\!-\!512\!-\!256\!-\!256$, ELU, privileged state (object pose, velocity, contacts, identity) & \\
+Environments & 8{,}192 in parallel & \textcolor{muted}{same as paper} \\
+Rollout / update & horizon 16, minibatch 16{,}384, 4 epochs & \textcolor{muted}{authors' script} \\
+PPO & clip 0.2, KL target 0.02 & \textcolor{muted}{same as paper} \\
+Discount / GAE & $\gamma = 0.99$, \; $\lambda = 0.95$ & \textcolor{muted}{authors' config} \\
+Learning rate & $10^{-4}$ actor, $5{\times}10^{-4}$ critic, adaptive & \textcolor{muted}{authors' config} \\
+Length & 5{,}000 epochs $\approx$ 655\,M environment steps & \textcolor{muted}{paper's Fig.~6: 0--5K} \\
+Objects & 100 train, 25 held out; mass 0.2--0.6\,kg, size $\times$0.95--1.10 & \\
+Compute & 1 GPU per run (NRP Nautilus cluster), about 1--1.5 days each & \\
+Seeds & 1 per sensor & \textcolor{muted}{paper: 3} \\
+\bottomrule
+\end{tabular}
+\end{slide}
+
+% ---------------------------------------------------------------- 4. reconstruction
+\begin{slide}
+\begin{tabular}{>{\bfseries}l l}
+\toprule
+\multicolumn{2}{l}{\textbf{Shape reconstruction (paper's Ablation II)}} \\
+\midrule
+Data & per rollout set: 57--60k drop-free 200-step windows (20\,s each), from that set's policy \\
+ & $\sim$45k from the 100 train objects, 12--14k from the 25 held-out objects \\
+Input & 16 hand joint angles (normalised) $\pm$ 16 touch values per step \\
+Label & object outline: 64 radii around the axis \\
+Network & temporal CNN: 4 conv1d blocks (kernel 5, BatchNorm, ReLU) $\to$ mean + max over time $\to$ MLP (237k params) \\
+Loss & MSE at the best of 64 rotations (start angle in hand is unknown) \\
+Training & AdamW $10^{-3}$, cosine schedule, 60 epochs, batch 256; 90 train objects (10 for validation); 5 seeds \\
+Compute & $\sim$1.5\,min per model on one GPU (RTX 2060 locally; NRP cluster GPU for 3 of the 4 sets) \\
+Metric & held-out MSE [mm$^2$], over all 25 test objects \\
+\bottomrule
+\end{tabular}
+\end{slide}
+
+\end{document}

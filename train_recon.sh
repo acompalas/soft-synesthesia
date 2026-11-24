@@ -3,6 +3,7 @@
 # policy that produced the set (baseline sets: binary, Park sets: Park).
 #   bash train_recon.sh baseline_latest            # sets: baseline_latest baseline_best park_latest park_best
 #   SEEDS="1 2 3" bash train_recon.sh park_best
+#   FORCE=1 bash train_recon.sh baseline_latest     # retrain seeds that already have models (default: skip them)
 # Input:  rollouts/recon/<set>/*.npz (shards from collect_recon.sh)
 # Output: models/shape_recon/<set>/seed<k>/ results.json, predictions_<signal>.npz, model_<signal>.pt
 set -eo pipefail
@@ -13,6 +14,11 @@ n=$( (find -L rollouts/recon/$SET -maxdepth 1 -name '*.npz' 2>/dev/null || true)
 echo "$SET: $n shards"
 touch_sig=binary; [[ $SET == park_* ]] && touch_sig=park
 for s in ${SEEDS:-1 2 3 4 5}; do
+  d=models/shape_recon/$SET/seed$s
+  if [ -z "$FORCE" ] && [ -s $d/model_none.pt ] && [ -s $d/model_$touch_sig.pt ] && [ -s $d/results.json ]; then
+    echo "== $SET seed $s: already trained ($d), skipping (FORCE=1 retrains)"; continue
+  fi
+  [ -n "$FORCE" ] && rm -rf $d                                   # no stale files from an earlier run
   echo "== $SET seed $s"
   python shape_recon.py --data rollouts/recon/$SET --signals none $touch_sig --seed $s \
       --out models/shape_recon/$SET/seed$s | tail -6

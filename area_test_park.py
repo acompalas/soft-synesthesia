@@ -217,6 +217,8 @@ def report(E, levels, R, CF, tested):
                       f" | {g_whole(F0, areas[i]):5.2f} / {g_one(F0, areas[i]):5.2f} | {np.round(share[k, :, i], 2)}")
 
     f_fine = np.linspace(0, levels.max(), 400)
+    # Which plates delivered their load where intended (same test as above): filled markers; the rest hollow.
+    good = np.concatenate([ok_whole[:, None], ok_one], 1)                            # (L, case, sensor)
 
     def panel(ax, i, small):
         A = areas[i]
@@ -225,9 +227,12 @@ def report(E, levels, R, CF, tested):
         ax.plot(f_fine, g_one(f_fine, A), color="0.6", lw=3 if small else 4, ls=":", zorder=1,
                 label=None if small else "model, one cell")
         for c, case in enumerate(CASES):
-            ax.scatter(levels, R[:, c, i], s=12 if small else 16, color=COLORS[case], zorder=3,
-                       marker="s" if case == "all" else "o",
+            g = good[:, c, i]
+            m = "s" if case == "all" else "o"
+            ax.scatter(levels[g], R[g, c, i], s=12 if small else 16, color=COLORS[case], zorder=3, marker=m,
                        label=None if small else ("whole pad" if case == "all" else f"only {case}"))
+            ax.scatter(levels[~g], R[~g, c, i], s=12 if small else 16, facecolors="none", edgecolors=COLORS[case],
+                       linewidths=0.8, alpha=0.6, zorder=2, marker=m)
         ax.set_box_aspect(1); ax.set_xlim(0, levels.max() * 1.03); ax.set_ylim(0, skin.g_max * 1.08)
 
     fig, axs = plt.subplots(4, 4, figsize=(12, 12))
@@ -241,14 +246,16 @@ def report(E, levels, R, CF, tested):
         if i % 4 == 0: ax.set_ylabel("dR/R0", fontsize=8)
         if i >= 12: ax.set_xlabel("plate weight (N)", fontsize=8)
     fig.suptitle(f"Same weight, different area (E = {E / 1e3:.0f} kPa): whole pad (black squares) vs one cell "
-                 "(red c0, orange c1, green c2, blue c3)", fontsize=10)
+                 "(red c0, orange c1, green c2, blue c3)\nfilled: plate stayed where placed (0.8-1.2x its weight "
+                 "delivered, one-cell plates >= 80% on the target cell); hollow: plate tipped or slid", fontsize=10)
     fig.tight_layout(); fig.savefig(os.path.join(OUT, "park_area_pads.png"), dpi=110)
 
     big = int(np.argmax([areas[i].sum() if t[i] else 0 for i in range(16)]))
     fig, ax = plt.subplots(figsize=(6.5, 6.5))
     panel(ax, big, small=False)
     ax.set_xlabel("plate weight (N)"); ax.set_ylabel("dR/R0"); ax.legend(fontsize=8, loc="upper left")
-    ax.set_title(f"Same weight, different area: {PADS[big]} (E = {E / 1e3:.0f} kPa)", fontsize=10)
+    ax.set_title(f"Same weight, different area: {PADS[big]} (E = {E / 1e3:.0f} kPa)\n"
+                 "hollow = plate tipped or slid off the intended area", fontsize=10)
     fig.tight_layout(); fig.savefig(os.path.join(OUT, "park_area_all.png"), dpi=130)
     np.savez(os.path.join(OUT, "area_results.npz"), E=E, force=levels, cases=np.array(CASES), pads=np.array(PADS),
              reading=R, cell_fn=CF, cell_area=areas, tested=tested)

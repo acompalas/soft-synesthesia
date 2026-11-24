@@ -2,7 +2,7 @@
 # Record the Fig. 7-style touch rollouts (viewer snapshots + GIF frames + touch signals) for each policy.
 #   bash record_fig7.sh                     # all four sets that are not recorded yet
 #   bash record_fig7.sh park_best           # one set;  FORCE=1 re-records an existing one
-#   OBJ=col_110 FORCE=1 bash record_fig7.sh # another held-out object (default col_092)
+#   OBJ=col_110 FORCE=1 bash record_fig7.sh # another held-out object (default col_067)
 # Every set rotates the same held-out object with the same seed, so the figures are comparable.
 # A viewer window opens for each recording. Output: rollouts/fig7/<set>/ (then: bash make_deliverables.sh)
 set -eo pipefail
@@ -12,7 +12,7 @@ declare -A CKPT=([baseline_best]=checkpoints/policies/baseline_ep4500.pth
                  [park_latest]=checkpoints/policies/park_ep5000.pth)
 COMMON="task=AllegroArmMOAR test=True seed=7 task.env.objSet=columns_test task.env.axis=z task.env.sensor=split4
   task.env.observationType=partial_stack task.env.ablation_mode=no-pc task.env.legacy_obs=True task.env.numEnvs=16
-  +task.env.record_object=${OBJ:-col_092} +task.env.record_gif=True"
+  +task.env.record_object=${OBJ:-col_067} +task.env.record_gif=True"
 PARK="+task.env.touch_model=park +task.env.park_E=338e3 +task.env.park_log_eps=0.003 +task.env.park_calib=False"
 SETS=${@:-baseline_best park_best baseline_latest park_latest}
 missing=0

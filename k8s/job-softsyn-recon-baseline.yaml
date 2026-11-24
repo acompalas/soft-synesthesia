@@ -1,0 +1,77 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: anderson-softsyn-recon-baseline
+  namespace: erl-ucsd-supp
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 43200        # 12 h
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations:
+      - key: "nautilus.io/reservation"
+        operator: "Equal"
+        value: "erl-ucsd"
+        effect: "NoSchedule"
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values: ["NVIDIA-GeForce-RTX-3090", "NVIDIA-GeForce-RTX-4090", "NVIDIA-A10", "NVIDIA-A40", "NVIDIA-L40", "NVIDIA-L40S", "NVIDIA-RTX-A5000", "NVIDIA-RTX-A6000", "NVIDIA-L4", "NVIDIA-A100-PCIE-40GB", "NVIDIA-A100-80GB-PCIe", "NVIDIA-A100-SXM4-80GB", "Tesla-V100-SXM2-32GB", "NVIDIA-TITAN-RTX", "Quadro-RTX-6000", "Quadro-RTX-8000"]
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values: ["nrp-01.laccd.edu", "ry-gpu-02.sdsc.optiputer.net"]
+      containers:
+      - name: main
+        image: nvcr.io/nvidia/cuda:11.8.0-cudnn8-devel-ubuntu20.04
+        command: ["bash", "-c"]
+        args:
+        - |
+          set -eo pipefail
+          export PYTHONUNBUFFERED=1
+          source /data/softsyn_env.sh
+          cd /data/soft-synesthesia && git pull --ff-only && git log --oneline -1
+          mkdir -p /data/logs /data/recon
+          E=4500
+          if [ "$E" = wait ]; then
+            f=/data/recon/baseline.epoch; n=0
+            until [ -s $f ]; do
+              n=$((n + 1)); [ $n -gt 120 ] && { echo "no $f after 2 h, exiting to free the GPU"; exit 1; }
+              echo "waiting for $f (minute $n)"; sleep 60
+            done
+            E=$(tr -d '[:space:]' < $f)
+          fi
+          echo "epoch: $E"
+          CKPT=$(ls /data/soft-synesthesia/runs/baseline-binary-split4/*/nn/*_ep_${E}_rew_*.pth | head -1)
+          echo "checkpoint: $CKPT"
+          test -s "$CKPT"
+          cp "$CKPT" /data/recon/ckpt_baseline_ep$E.pth
+          OUT=/data/recon/baseline_ep$E ENVS=2000 EXTRA="" \
+            bash collect_recon.sh /data/recon/ckpt_baseline_ep$E.pth 2>&1 | tee /data/logs/recon_baseline.log
+          echo "=== DONE"
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+            cpu: "4"
+            memory: 16Gi
+          requests:
+            nvidia.com/gpu: 1
+            cpu: "4"
+            memory: 16Gi
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 8Gi
+      - name: data
+        persistentVolumeClaim:
+          claimName: anderson-softsyn-data
