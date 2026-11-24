@@ -5,6 +5,10 @@
 #        bash make_recon_job.sh parkfixed park-ds20-fixed-split4 4000 "+task.env.touch_model=park +task.env.park_E=338e3 +task.env.park_log_eps=0.003 +task.env.park_calib=False"
 # The job finds runs/RUN_DIR/*/nn/*_ep_EPOCH_rew_*.pth on the drive, runs collect_recon.sh with 2000 envs per
 # round, and writes shards to /data/recon/NAME_epEPOCH/ and its log to /data/logs/recon_NAME.log.
+# EPOCH may be "wait": the job is submitted now (so it can queue) and, once running, waits up to 2 h for the
+# file /data/recon/NAME.epoch, e.g. written with
+#   kubectl -n erl-ucsd-supp exec job/anderson-softsyn-recon-NAME -- bash -c 'echo 4000 > /data/recon/NAME.epoch'
+# If no epoch arrives in 2 h the job exits and frees the GPU.
 set -eo pipefail
 NAME=$1; RUN=$2; EPOCH=$3; EXTRA=${4:-}
 [ -n "$NAME" ] && [ -n "$RUN" ] && [ -n "$EPOCH" ] || { sed -n 2,7p "$0"; exit 1; }
@@ -48,12 +52,22 @@ spec:
           source /data/softsyn_env.sh
           cd /data/soft-synesthesia && git pull --ff-only && git log --oneline -1
           mkdir -p /data/logs /data/recon
-          CKPT=\$(ls /data/soft-synesthesia/runs/$RUN/*/nn/*_ep_${EPOCH}_rew_*.pth | head -1)
+          E=$EPOCH
+          if [ "\$E" = wait ]; then
+            f=/data/recon/$NAME.epoch; n=0
+            until [ -s \$f ]; do
+              n=\$((n + 1)); [ \$n -gt 120 ] && { echo "no \$f after 2 h, exiting to free the GPU"; exit 1; }
+              echo "waiting for \$f (minute \$n)"; sleep 60
+            done
+            E=\$(tr -d '[:space:]' < \$f)
+          fi
+          echo "epoch: \$E"
+          CKPT=\$(ls /data/soft-synesthesia/runs/$RUN/*/nn/*_ep_\${E}_rew_*.pth | head -1)
           echo "checkpoint: \$CKPT"
           test -s "\$CKPT"
-          cp "\$CKPT" /data/recon/ckpt_${NAME}_ep${EPOCH}.pth
-          OUT=/data/recon/${NAME}_ep${EPOCH} ENVS=2000 EXTRA="$EXTRA" \\
-            bash collect_recon.sh /data/recon/ckpt_${NAME}_ep${EPOCH}.pth 2>&1 | tee /data/logs/recon_$NAME.log
+          cp "\$CKPT" /data/recon/ckpt_${NAME}_ep\$E.pth
+          OUT=/data/recon/${NAME}_ep\$E ENVS=2000 EXTRA="$EXTRA" \\
+            bash collect_recon.sh /data/recon/ckpt_${NAME}_ep\$E.pth 2>&1 | tee /data/logs/recon_$NAME.log
           echo "=== DONE"
         resources:
           limits:

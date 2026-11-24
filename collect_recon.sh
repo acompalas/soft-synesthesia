@@ -24,7 +24,9 @@ print(n)
 PY
 }
 
-seed=$(( $(ls "$OUT"/*.npz 2>/dev/null | wc -l) + SEED0 ))   # resume-safe: new seeds after existing shards
+# resume-safe: new seeds after existing shards (find, not ls: ls fails on an empty folder, and with pipefail that
+# silently ended the script)
+seed=$(( $(find "$OUT" -maxdepth 1 -name '*.npz' | wc -l) + SEED0 ))
 for SET in train test; do
   target_var=TARGET_$SET; target=${!target_var}
   while true; do
