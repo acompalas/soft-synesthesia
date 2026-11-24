@@ -4,12 +4,16 @@
 # Each round: record 500 steps of every env with a new seed, cut it into drop-free 200-step windows
 # (build_recon_dataset.py -> one shard), delete the raw recording, update the counts.
 # Usage (from the repo root, soft-syn env):  bash collect_recon.sh [checkpoint] [train_target] [test_target]
+# Environment overrides: OUT (shard folder), ENVS (envs per round), EXTRA (extra task flags, e.g. the Park
+# sensor flags for a Park policy), SEED0 (first seed). Raw recordings go to $OUT/raw_* and are deleted.
 set -eo pipefail
 CKPT=${1:-checkpoints/baseline_final.pth}
 TARGET_train=${2:-44000}
 TARGET_test=${3:-11000}
-ENVS=1000
-OUT=rollouts/recon_shards
+ENVS=${ENVS:-1000}
+OUT=${OUT:-rollouts/recon_shards}
+EXTRA=${EXTRA:-}
+SEED0=${SEED0:-100}
 mkdir -p "$OUT"
 
 count() {  # windows so far in shards of split $1
@@ -20,18 +24,18 @@ print(n)
 PY
 }
 
-seed=$(( $(ls "$OUT" 2>/dev/null | wc -l) + 100 ))   # resume-safe: new seeds after existing shards
+seed=$(( $(ls "$OUT"/*.npz 2>/dev/null | wc -l) + SEED0 ))   # resume-safe: new seeds after existing shards
 for SET in train test; do
   target_var=TARGET_$SET; target=${!target_var}
   while true; do
     have=$(count $SET)
     echo "[collect] $SET: $have / $target windows"
     [ "$have" -ge "$target" ] && break
-    raw=rollouts/recon_raw_${SET}_s${seed}
+    raw=$OUT/raw_${SET}_s${seed}
     python isaacgymenvs/train.py task=AllegroArmMOAR test=True checkpoint=$CKPT headless=True seed=$seed \
       task.env.objSet=columns_$SET task.env.axis=z task.env.sensor=split4 \
       task.env.observationType=partial_stack task.env.ablation_mode=no-pc task.env.legacy_obs=True \
-      task.env.numEnvs=$ENVS +task.env.objects_in_order=True +task.env.player_games=100000 \
+      task.env.numEnvs=$ENVS +task.env.objects_in_order=True +task.env.player_games=100000 $EXTRA \
       +task.env.recon_dir=$raw +task.env.recon_steps=500 2>&1 | grep -E "^\[recon\] (saved|[0-9]+ envs)|rror" || true
     [ -f $raw/recon_rollout.npz ] || { echo "[collect] recording failed (seed $seed)"; exit 1; }
     python build_recon_dataset.py $raw/recon_rollout.npz --out $OUT/${SET}_s${seed}.npz | grep -E "kept|windows over"
