@@ -2068,6 +2068,68 @@ class AllegroArmMOAR(VecTask):
         self._run_state_replay()
         self._record_touch_step()
         self._force_stats_step()
+        self._record_recon_step()
+
+    # ------------------------------------------------------------------ shape-reconstruction rollouts
+    # +task.env.recon_dir=DIR [+task.env.recon_steps=500]: records every env for recon_steps control
+    # steps, saves DIR/recon_rollout.npz, then exits. Use with +task.env.objects_in_order=True so env i
+    # holds object i mod N, and +task.env.player_games=100000 so the eval player does not stop first.
+    # Per step (T, N, ...): arm + hand dof positions, object pose, the touch signal the policy received,
+    # pad force norms (for binary touch offline), cell compressive normal forces (for the Park skin
+    # offline), reset flags and episode step. +task.env.recon_poses=True also saves the base_link and
+    # pad poses (larger files). Per env: object name, scale, train/test split, and the 64-radius
+    # outline label scaled to that env. build_recon_dataset.py cuts this into drop-free windows.
+    def _record_recon_step(self):
+        out_dir = self.cfg["env"].get("recon_dir", None)
+        if not out_dir:
+            return
+        T = int(self.cfg["env"].get("recon_steps", 500))
+        if not hasattr(self, "_recon"):
+            os.makedirs(out_dir, exist_ok=True)
+            reg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../assets/urdf/objects/meshes/columns.json")
+            reg = json.load(open(reg_path))
+            radii = dict(zip(reg["names"], reg["outline_radii_m"]))
+            names = [self.used_training_objects[int(i)] for i in self.object_class_indices]
+            scales = [float(self.gym.get_actor_scale(e, self.gym.find_actor_handle(e, "object"))) for e in self.envs]
+            base = self.gym.find_actor_rigid_body_handle(self.envs[0], self.arm_hands[0], "base_link")
+            assert base >= 0, "base_link not found"
+            self._recon = {"t": 0, "base_idx": base, "pad_idx": self.sensor_handle_indices[::self.n_cells],
+                           "names": names, "scales": np.array(scales),
+                           "split": np.array(["test" if n in reg["test"] else "train" for n in names]),
+                           "radii": np.array([np.array(radii[n]) * sc for n, sc in zip(names, scales)]),
+                           "dof_pos": [], "base_pose": [], "pad_pose": [], "obj_pose": [], "sensed": [],
+                           "pad_force": [], "cell_fn": [], "reset": [], "progress": []}
+            print(f"[recon] {self.num_envs} envs, {len(set(names))} objects, {T} steps, touch model {self.touch_model}; "
+                  f"writing to {out_dir}")
+        r = self._recon
+        f32 = lambda x: x.detach().float().cpu().numpy()
+        r["dof_pos"].append(f32(self.arm_hand_dof_pos))
+        if self.cfg["env"].get("recon_poses", False):
+            r["base_pose"].append(f32(self.rigid_body_states[:, r["base_idx"], 0:7]))
+            r["pad_pose"].append(f32(self.rigid_body_states[:, r["pad_idx"], 0:7]))
+        r["obj_pose"].append(f32(self.object_pose))
+        r["sensed"].append(f32(self.sensed_contacts))
+        r["pad_force"].append(f32(torch.norm(self.last_pad_forces, dim=-1)))
+        r["cell_fn"].append(f32(self._cell_contact_forces()[1]))
+        r["reset"].append(f32(self.reset_buf).astype(bool))
+        r["progress"].append(f32(self.progress_buf).astype(np.int32))
+        r["t"] += 1
+        if r["t"] % 100 == 0:
+            print(f"[recon] step {r['t']}/{T}")
+        if r["t"] < T:
+            return
+        path = os.path.join(out_dir, "recon_rollout.npz")
+        np.savez_compressed(path, **{k: np.stack(r[k]) for k in ("dof_pos", "base_pose", "pad_pose", "obj_pose", "sensed",
+                                                                 "pad_force", "cell_fn", "reset", "progress") if r[k]},
+                            object=np.array(r["names"]), obj_scale=r["scales"], split=r["split"], radii=r["radii"],
+                            pad_names=np.array(self.pad_names), touch_model=self.touch_model,
+                            park_E=float(self.cfg["env"].get("park_E", 69e3)),
+                            park_log_eps=float(self.cfg["env"].get("park_log_eps") or 0.0),
+                            park_calib=bool(self.cfg["env"].get("park_calib", True)),
+                            latency=self.latency, sensor_noise=self.sensor_noise,
+                            angle_convention="radius k at angle 2*pi*k/64 from +x towards +y, object frame, about z")
+        print(f"[recon] saved {path}. Done; exiting.")
+        raise SystemExit(0)
 
     # Enabled with +task.env.force_stats=<control steps>. Collects every env's 16 pad force norms
     # (the force the binary threshold and the Park model see) for that many steps, prints their

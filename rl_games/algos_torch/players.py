@@ -164,7 +164,7 @@ class PpoPlayerContinuous(BasePlayer):
         obj_set = self.env.cfg['env']['objSet']
         n_object = n_object_dict[obj_set] if obj_set in n_object_dict else self.env.num_training_objects
         object_count_dict = {'game_count': np.zeros(n_object), 'reward_sum': np.zeros(n_object), 'step_sum': np.zeros(n_object)}
-        n_games = 500
+        n_games = int(self.env.cfg['env'].get('player_games', 500))  # +task.env.player_games=N for long recordings
         print(n_games, self.max_steps, self.n_game_life)
 
         for game_idx in range(n_games):
